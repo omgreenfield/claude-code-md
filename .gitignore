@@ -1,0 +1,16 @@
+/.bundle/
+/.yardoc
+/_yardoc/
+/coverage/
+/doc/
+/pkg/
+/spec/reports/
+/tmp/
+
+# rspec failure tracking
+.rspec_status
+
+# The global gitignore excludes docs/designs so agent-written docs stay local in
+# work repos. In this project the design is part of what ships, so re-include it.
+!docs/designs/
+!docs/designs/**
