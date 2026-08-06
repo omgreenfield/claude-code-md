@@ -2,11 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build `ccmd` so a markdown file becomes a working conversation with CC — you type, press cmd+enter, and the reply streams into the same file.
+**Goal:** Build `ccmd` so a markdown file becomes a working conversation with CC — you type, press cmd+enter, and the reply streams into the same file — including answering CC's questions in place beneath them rather than restating them at the bottom.
 
-**Architecture:** A long-lived `claude -p` child process is fed one JSON line per turn over stdin. A reader thread decodes its stdout onto a queue; the main thread interleaves draining that queue with polling for a send signal. Prose appends to the conversation file, everything else to a sibling trace file. All conversation writes are appends, so the user editing the file mid-turn never loses work.
+**Architecture:** A long-lived `claude -p` child is fed one JSON line per turn over stdin. A reader thread decodes its stdout onto a queue; the main thread interleaves draining that queue with polling for a send signal. Prose appends to the conversation file, everything else to a sibling trace. Because ccmd authored every byte of every block, it keeps snapshots in a sibling state file and diffs them on send, which is how answers written under a question get found and paired to it.
 
 **Tech Stack:** Ruby 3.4+, Thor, `omg-thor-ext`, RSpec, RuboCop. Everything else is standard library.
+
+**Specs this implements:** [design.8_5_2026.ccmd_architecture.md](../designs/design.8_5_2026.ccmd_architecture.md) and [design.8_5_2026.inline_responses.md](../designs/design.8_5_2026.inline_responses.md).
 
 ## Global Constraints
 
@@ -14,11 +16,50 @@
 - Runtime dependencies are exactly `thor ~> 1.5` and `omg-thor-ext ~> 0.1`. Everything else must be standard library. Do not add a gem without changing this line.
 - `bundle exec rake` (RSpec + RuboCop) must pass before every commit.
 - Strings are double-quoted; every file starts with `# frozen_string_literal: true`.
-- Every write to a conversation file uses append mode. Never rewrite a conversation file after creation.
-- No spec may spawn the real `claude` binary. Subprocess behavior is tested against the fake executable built in Task 9.
+- Every write to a conversation file uses append mode. Never rewrite a conversation file after creation. The state file is the sole exception and is rewritten atomically.
+- No spec may spawn the real `claude` binary. Subprocess behavior is tested against the fake executable built in Task 15.
 - In prose and docs, write `CC`, not "Claude Code".
 - Document classes and public methods. Omit docs where they add nothing. Put a blank commented line between a method description and any `@param`. Omit `@return [void]`.
 - Namespace is `ClaudeCodeMd`. Files live in `lib/claude_code_md/`, specs mirror them in `spec/`.
+- Every new file must be added to the `require_relative` list in `lib/claude_code_md.rb` in the task that creates it.
+
+## Task Index
+
+Pure components come first so the impure ones have something correct to build on.
+
+| # | Task | Kind |
+| --- | --- | --- |
+| 1 | Record protocol fixtures | fixtures |
+| 2 | Frontmatter and turn markers | pure |
+| 3 | Marker vocabulary and configuration | pure |
+| 4 | Trailing-block delta extraction | pure |
+| 5 | Block index | pure |
+| 6 | Inline response detection | pure |
+| 7 | Turn composer | pure |
+| 8 | Event codec | pure |
+| 9 | Conversation state | file I/O |
+| 10 | Conversation file | file I/O |
+| 11 | Trace file | file I/O |
+| 12 | Send gate | file I/O |
+| 13 | Location resolution | file I/O |
+| 14 | Conversation index | file I/O |
+| 15 | Claude process | subprocess |
+| 16 | Transcript renderer and prose stream | wiring |
+| 17 | Turn state | pure |
+| 18 | Session orchestrator | wiring |
+| 19 | The `open` command | CLI |
+| 20 | The `ls`, `trace`, and `setup` commands | CLI |
+
+## Divergences From The Designs
+
+Recorded up front so no task silently contradicts a spec. Each has a step that corrects the design text.
+
+1. **`ConversationFile` does not own options-line rendering.** Inserting an options line after a marker line requires buffering streamed deltas until a line completes, which is stream concern, not file concern. `ProseStream` (Task 16) owns it.
+2. **`ConversationFile` does not update `ConversationState`.** `Session` already owns turn boundaries, so it advances snapshots (Task 18).
+3. **`TurnState` collapses `tool-wait`.** Nothing behaves differently during a tool call, so a fourth state would carry no information (Task 17).
+4. **`ccmd setup` prints by default.** VSCode config is JSONC and comments cannot survive a JSON round trip, so writing is opt-in and refuses files it cannot rewrite faithfully (Task 20).
+5. **`ClaudeProcess#interrupt` is not implemented.** The control-protocol field shapes are unverified, so Ctrl+C stops the child and the next turn resumes (Task 15).
+6. **`consumed` is keyed by marker hash *and* response hash**, not marker hash alone. Marker-only keying would make "same answer saved twice → sent once" work but break "answer edited after being sent → sent as a follow-up". Both edge cases are in the inline-responses spec, and only the pair satisfies both (Task 9).
 
 ---
 
@@ -27,14 +68,11 @@
 Every later task's tests depend on real CC output rather than a guess at its shape. Capture it once, commit it, and never call the network in a spec again.
 
 **Files:**
-- Create: `spec/fixtures/README.md`
-- Create: `spec/fixtures/text_only.jsonl`
-- Create: `spec/fixtures/with_tools.jsonl`
-- Create: `spec/fixtures/with_thinking.jsonl`
+- Create: `spec/fixtures/README.md`, `spec/fixtures/text_only.jsonl`, `spec/fixtures/with_tools.jsonl`, `spec/fixtures/with_thinking.jsonl`
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: three JSONL fixture files, each one complete turn of `claude` stdout, ending in a `result` line.
+- Produces: three JSONL fixtures, each one complete turn of `claude` stdout ending in a `result` line.
 
 - [ ] **Step 1: Capture a text-only turn**
 
@@ -69,7 +107,7 @@ printf '%s\n' "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\
   > with_thinking.jsonl
 ```
 
-- [ ] **Step 4: Verify each fixture is complete and note the delta shapes**
+- [ ] **Step 4: Verify each fixture and note the delta shapes**
 
 ```bash
 cd spec/fixtures
@@ -80,11 +118,11 @@ for f in *.jsonl; do
 done
 ```
 
-Expected: each file prints exactly one `result:` line, and the delta types printed are the ones later tasks must handle. **If `with_thinking.jsonl` shows no thinking delta type, record that in `spec/fixtures/README.md` and skip the thinking assertions in Task 10 rather than inventing a shape.**
+Expected: each file prints exactly one `result:` line, plus the delta types later tasks must handle. **If `with_thinking.jsonl` shows no thinking delta type, record that in the fixtures README and skip the thinking assertions in Task 16 rather than inventing a shape.**
 
 - [ ] **Step 5: Document the fixtures**
 
-Write `spec/fixtures/README.md` naming each file, the command that produced it, the `claude` version (`claude --version`), and the delta types observed in Step 4.
+Write `spec/fixtures/README.md` naming each file, the command that produced it, the output of `claude --version`, and the delta types seen in Step 4.
 
 - [ ] **Step 6: Commit**
 
@@ -98,10 +136,8 @@ git commit -m "test: record CC stream-json fixtures"
 ### Task 2: Frontmatter and turn markers
 
 **Files:**
-- Create: `lib/claude_code_md/frontmatter.rb`
-- Create: `lib/claude_code_md/turn_marker.rb`
-- Create: `spec/frontmatter_spec.rb`
-- Create: `spec/turn_marker_spec.rb`
+- Create: `lib/claude_code_md/frontmatter.rb`, `lib/claude_code_md/turn_marker.rb`
+- Create: `spec/frontmatter_spec.rb`, `spec/turn_marker_spec.rb`
 - Modify: `lib/claude_code_md.rb`
 
 **Interfaces:**
@@ -112,6 +148,7 @@ git commit -m "test: record CC stream-json fixtures"
   - `TurnMarker.render(turn:, role:, time:) -> String` — comment line, heading line, blank line.
   - `TurnMarker.scan(String) -> Array<[line_index, turn_number, role_symbol]>`.
   - `TurnMarker.last_turn_number(String) -> Integer`, `0` when there are no markers.
+  - `TurnMarker::PATTERN`, `TurnMarker::HEADING_PATTERN`.
 
 - [ ] **Step 1: Write the failing specs**
 
@@ -166,6 +203,11 @@ RSpec.describe ClaudeCodeMd::TurnMarker do
 
   it "ignores a marker that is not alone on its line" do
     expect(described_class.scan("text <!-- ccmd:turn=1 role=me -->\n")).to be_empty
+  end
+
+  it "recognises the visible heading it writes" do
+    expect("## CC — 14:33").to match(described_class::HEADING_PATTERN)
+    expect("## Something else").not_to match(described_class::HEADING_PATTERN)
   end
 
   it "reports zero when no markers exist" do
@@ -224,6 +266,7 @@ module ClaudeCodeMd
   # why parsing never relies on the heading.
   module TurnMarker
     PATTERN = /\A<!-- ccmd:turn=(\d+) role=(me|cc) -->\z/
+    HEADING_PATTERN = /\A## (?:Me|CC) — \d{2}:\d{2}\z/
     ROLE_HEADINGS = { me: "Me", cc: "CC" }.freeze
 
     # @param role [Symbol] :me or :cc
@@ -255,7 +298,7 @@ require_relative "claude_code_md/frontmatter"
 require_relative "claude_code_md/turn_marker"
 ```
 
-- [ ] **Step 4: Run the specs to verify they pass**
+- [ ] **Step 4: Run to verify they pass**
 
 Run: `bundle exec rake`
 Expected: all examples pass, no RuboCop offenses.
@@ -269,7 +312,240 @@ git commit -m "feat: parse conversation frontmatter and turn markers"
 
 ---
 
-### Task 3: Delta extraction
+### Task 3: Marker vocabulary and configuration
+
+**Files:**
+- Create: `lib/claude_code_md/markers.rb`
+- Create: `spec/markers_spec.rb`
+- Modify: `lib/claude_code_md.rb`
+
+**Interfaces:**
+- Consumes: `ClaudeCodeMd::Error`.
+- Produces: `Markers.from_env(env) -> Markers`, and on an instance: `#symbols`, `#options_label`, `#enabled?`, `#show_options?`, `#prompt_symbols`, `#prompt_marker_for(line) -> String | nil`, `#indent_of(line) -> Integer | nil`, `#options_line(indent:) -> String`, `#options_line?(line) -> Boolean`, `#strip_options(text) -> String`, `#vocabulary_prompt -> String`. Raises `Markers::ConfigError` on an ambiguous boolean or a colliding options label.
+
+- [ ] **Step 1: Write the failing spec**
+
+```ruby
+# spec/markers_spec.rb
+# frozen_string_literal: true
+
+RSpec.describe ClaudeCodeMd::Markers do
+  it "defaults to the code-comment-threads vocabulary" do
+    markers = described_class.from_env({})
+
+    expect(markers.symbols).to eq(question: "❓", request: "❗️", reply: "💬", approve: "✅", reject: "❌")
+    expect(markers).to be_enabled
+    expect(markers).to be_show_options
+  end
+
+  it "takes overrides from the environment" do
+    markers = described_class.from_env("CCMD_QUESTION_MARKER" => "(?)")
+
+    expect(markers.symbols[:question]).to eq("(?)")
+    expect(markers.prompt_marker_for("- (?) really?")).to eq("(?)")
+  end
+
+  it "identifies a prompt marker at the start of a list item" do
+    markers = described_class.from_env({})
+
+    expect(markers.prompt_marker_for("- ❓ a question")).to eq("❓")
+    expect(markers.prompt_marker_for("  - ❗️ a request")).to eq("❗️")
+    expect(markers.prompt_marker_for("- ✅ an answer")).to be_nil
+    expect(markers.prompt_marker_for("❓ not a list item")).to be_nil
+    expect(markers.prompt_marker_for("- text then ❓")).to be_nil
+  end
+
+  it "matches a marker whose emoji presentation selector is missing" do
+    markers = described_class.from_env({})
+
+    expect(markers.prompt_marker_for("- ❗ no variation selector")).to eq("❗️")
+  end
+
+  it "reports list indentation" do
+    markers = described_class.from_env({})
+
+    expect(markers.indent_of("- top level")).to eq(0)
+    expect(markers.indent_of("    - nested")).to eq(4)
+    expect(markers.indent_of("prose")).to be_nil
+  end
+
+  it "renders an options line nested under its marker" do
+    line = described_class.from_env({}).options_line(indent: 0)
+
+    expect(line).to eq("  - Options: ✅ approve · ❌ reject · 💬 reply\n")
+  end
+
+  it "recognises and strips its own options lines" do
+    markers = described_class.from_env({})
+    text = "- ❓ a question\n#{markers.options_line(indent: 0)}  - ✅ yes\n"
+
+    expect(markers.strip_options(text)).to eq("- ❓ a question\n  - ✅ yes\n")
+  end
+
+  it "disables options lines when inline responses are off" do
+    markers = described_class.from_env("CCMD_INLINE_RESPONSES" => "false")
+
+    expect(markers).not_to be_enabled
+    expect(markers).not_to be_show_options
+  end
+
+  it "accepts the documented boolean spellings" do
+    %w[1 true yes on].each { |raw| expect(described_class.from_env("CCMD_SHOW_OPTIONS" => raw)).to be_show_options }
+    %w[0 false no off].each { |raw| expect(described_class.from_env("CCMD_SHOW_OPTIONS" => raw)).not_to be_show_options }
+  end
+
+  it "rejects an ambiguous boolean rather than guessing" do
+    expect { described_class.from_env("CCMD_SHOW_OPTIONS" => "maybe") }
+      .to raise_error(described_class::ConfigError, /CCMD_SHOW_OPTIONS/)
+  end
+
+  it "rejects an options label that would parse as a message" do
+    expect { described_class.from_env("CCMD_OPTIONS_LABEL" => "💬 choices:") }
+      .to raise_error(described_class::ConfigError, /must not begin with/)
+  end
+
+  it "names the configured markers in the vocabulary prompt" do
+    prompt = described_class.from_env("CCMD_QUESTION_MARKER" => "(?)").vocabulary_prompt
+
+    expect(prompt).to include("(?)").and include("Do not write options lines")
+  end
+end
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `bundle exec rspec spec/markers_spec.rb`
+Expected: FAIL with `uninitialized constant ClaudeCodeMd::Markers`.
+
+- [ ] **Step 3: Implement**
+
+```ruby
+# lib/claude_code_md/markers.rb
+# frozen_string_literal: true
+
+module ClaudeCodeMd
+  # The marker vocabulary, borrowed from the code-comment-threads skill so the
+  # same symbols mean the same things in both places, plus the switches that
+  # turn inline responses and options lines on and off. Resolved once at startup
+  # so every component sees identical symbols.
+  class Markers
+    class ConfigError < Error; end
+
+    DEFAULTS = { question: "❓", request: "❗️", reply: "💬", approve: "✅", reject: "❌" }.freeze
+
+    ENV_KEYS = {
+      question: "CCMD_QUESTION_MARKER",
+      request: "CCMD_REQUEST_MARKER",
+      reply: "CCMD_REPLY_MARKER",
+      approve: "CCMD_APPROVE_MARKER",
+      reject: "CCMD_REJECT_MARKER"
+    }.freeze
+
+    DEFAULT_OPTIONS_LABEL = "Options:"
+    PROMPT_KINDS = %i[question request].freeze
+    LIST_ITEM = /\A(\s*)(?:[-*+]|\d+[.)])\s+(.*)\z/
+    TRUTHY = %w[1 true yes on].freeze
+    FALSEY = %w[0 false no off].freeze
+    VARIATION_SELECTOR = "\uFE0F"
+
+    attr_reader :symbols, :options_label
+
+    def self.from_env(env = ENV)
+      new(symbols: ENV_KEYS.to_h { |kind, key| [kind, env.fetch(key, DEFAULTS.fetch(kind))] },
+          options_label: env.fetch("CCMD_OPTIONS_LABEL", DEFAULT_OPTIONS_LABEL),
+          enabled: boolean(env, "CCMD_INLINE_RESPONSES", default: true),
+          show_options: boolean(env, "CCMD_SHOW_OPTIONS", default: true))
+    end
+
+    # Ambiguous values are rejected rather than guessed, matching the skill.
+    def self.boolean(env, key, default:)
+      raw = env[key]
+      return default if raw.nil? || raw.to_s.empty?
+
+      normalized = raw.strip.downcase
+      return true if TRUTHY.include?(normalized)
+      return false if FALSEY.include?(normalized)
+
+      raise ConfigError, "#{key} must be one of #{(TRUTHY + FALSEY).join(", ")}, got #{raw.inspect}"
+    end
+    private_class_method :boolean
+
+    def initialize(symbols: DEFAULTS, options_label: DEFAULT_OPTIONS_LABEL, enabled: true, show_options: true)
+      @symbols = symbols.freeze
+      @options_label = options_label
+      @enabled = enabled
+      @show_options = show_options
+      validate_options_label!
+    end
+
+    def enabled? = @enabled
+    def show_options? = @show_options && @enabled
+    def prompt_symbols = @symbols.values_at(*PROMPT_KINDS)
+
+    # @return [String, nil] the prompt marker this list item begins with
+    def prompt_marker_for(line)
+      match = LIST_ITEM.match(line.chomp)
+      return nil unless match
+
+      body = normalize(match[2])
+      prompt_symbols.find { |symbol| body.start_with?(normalize(symbol)) }
+    end
+
+    # @return [Integer, nil] leading whitespace width, nil when the line is not a list item
+    def indent_of(line) = LIST_ITEM.match(line.chomp)&.then { |match| match[1].length }
+
+    def options_line(indent:)
+      approve, reject, reply = @symbols.values_at(:approve, :reject, :reply)
+      "#{" " * (indent + 2)}- #{@options_label} #{approve} approve · #{reject} reject · #{reply} reply\n"
+    end
+
+    def options_line?(line) = line.include?("- #{@options_label} ")
+
+    def strip_options(text) = text.lines.reject { |line| options_line?(line) }.join
+
+    # Appended to CC's system prompt so it knows the vocabulary exists.
+    def vocabulary_prompt
+      question, request = @symbols.values_at(:question, :request)
+      "You are talking to the user inside a markdown file. When you need decisions, write each " \
+        "one as its own list item beginning with #{question} for a question or #{request} for a " \
+        "request. The user answers beneath each item, so keep each item self-contained and " \
+        "answerable on its own. Do not write options lines; the harness adds them."
+    end
+
+    private
+
+    # Emoji presentation selectors vary between editors, so compare without them.
+    def normalize(text) = text.delete(VARIATION_SELECTOR)
+
+    def validate_options_label!
+      offender = @symbols.values.find { |symbol| normalize(@options_label).start_with?(normalize(symbol)) }
+      return unless offender
+
+      raise ConfigError, "CCMD_OPTIONS_LABEL must not begin with the marker #{offender}"
+    end
+  end
+end
+```
+
+Add `require_relative "claude_code_md/markers"` to `lib/claude_code_md.rb`.
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `bundle exec rake`
+Expected: all pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lib/claude_code_md.rb lib/claude_code_md/markers.rb spec/markers_spec.rb
+git commit -m "feat: resolve the inline-response marker vocabulary"
+```
+
+---
+
+### Task 4: Trailing-block delta extraction
+
+This is no longer the whole story of what gets sent — it is one of two inputs to `TurnComposer` in Task 7, the other being inline responses. It still owns exactly one question: what did you type in the trailing block?
 
 **Files:**
 - Create: `lib/claude_code_md/delta_extractor.rb`
@@ -277,8 +553,8 @@ git commit -m "feat: parse conversation frontmatter and turn markers"
 - Modify: `lib/claude_code_md.rb`
 
 **Interfaces:**
-- Consumes: `TurnMarker.scan` from Task 2.
-- Produces: `DeltaExtractor.call(String) -> String` (the user's new text, stripped) and `DeltaExtractor::SEND_TOKEN == "/send"`.
+- Consumes: `TurnMarker.scan`.
+- Produces: `DeltaExtractor.call(String) -> String` and `DeltaExtractor::SEND_TOKEN == "/send"`.
 
 - [ ] **Step 1: Write the failing spec**
 
@@ -338,7 +614,7 @@ RSpec.describe ClaudeCodeMd::DeltaExtractor do
 end
 ```
 
-- [ ] **Step 2: Run the spec to verify it fails**
+- [ ] **Step 2: Run to verify it fails**
 
 Run: `bundle exec rspec spec/delta_extractor_spec.rb`
 Expected: FAIL with `uninitialized constant ClaudeCodeMd::DeltaExtractor`.
@@ -352,8 +628,9 @@ Expected: FAIL with `uninitialized constant ClaudeCodeMd::DeltaExtractor`.
 require_relative "turn_marker"
 
 module ClaudeCodeMd
-  # Pulls the text the user just typed out of a conversation file: everything
-  # after the final user marker's heading, minus the send token.
+  # Pulls the text the user typed in the trailing block: everything after the
+  # final user marker's heading, minus the send token. Inline responses written
+  # further up the file are found by InlineResponses, not here.
   module DeltaExtractor
     SEND_TOKEN = "/send"
 
@@ -391,12 +668,774 @@ Expected: all pass.
 
 ```bash
 git add lib/claude_code_md.rb lib/claude_code_md/delta_extractor.rb spec/delta_extractor_spec.rb
-git commit -m "feat: extract the pending user turn from a conversation"
+git commit -m "feat: extract the trailing block's pending text"
 ```
 
 ---
 
-### Task 4: Event codec
+### Task 5: Block index
+
+**Files:**
+- Create: `lib/claude_code_md/block_index.rb`
+- Create: `spec/block_index_spec.rb`
+- Modify: `lib/claude_code_md.rb`
+
+**Interfaces:**
+- Consumes: `TurnMarker`, `Markers`.
+- Produces: `BlockIndex.call(String) -> Array<BlockIndex::Block>`; `Block#turn`, `#role`, `#body`, `#lines`, `#prompt_line_indexes(markers) -> Array<Integer>`; `BlockIndex.outside_fences(lines) -> Array<Integer>`; raises `BlockIndex::CorruptedError` naming the line number when a heading has no marker comment above it.
+
+Guessing block boundaries would silently send the wrong text, so corruption is a hard failure rather than a recovery.
+
+- [ ] **Step 1: Write the failing spec**
+
+```ruby
+# spec/block_index_spec.rb
+# frozen_string_literal: true
+
+RSpec.describe ClaudeCodeMd::BlockIndex do
+  let(:markers) { ClaudeCodeMd::Markers.from_env({}) }
+
+  let(:conversation) do
+    <<~MD
+      ---
+      session_id: abc-123
+      ---
+
+      <!-- ccmd:turn=1 role=me -->
+      ## Me — 14:32
+
+      why is this flaky
+
+      <!-- ccmd:turn=1 role=cc -->
+      ## CC — 14:33
+
+      Two things:
+
+      - ❓ Should ls scan both locations?
+      - ❗️ Confirm the poll interval.
+
+      <!-- ccmd:turn=2 role=me -->
+      ## Me — 14:41
+
+    MD
+  end
+
+  it "splits the document into blocks in order" do
+    blocks = described_class.call(conversation)
+
+    expect(blocks.map { |block| [block.turn, block.role] }).to eq([[1, :me], [1, :cc], [2, :me]])
+  end
+
+  it "excludes the marker comment and heading from the body" do
+    body = described_class.call(conversation).first.body
+
+    expect(body).not_to include("ccmd:turn").and not_include("## Me")
+    expect(body.strip).to eq("why is this flaky")
+  end
+
+  it "gives the trailing block an empty body" do
+    expect(described_class.call(conversation).last.body.strip).to eq("")
+  end
+
+  it "finds prompt lines within a block" do
+    cc_block = described_class.call(conversation)[1]
+
+    expect(cc_block.prompt_line_indexes(markers).map { |index| cc_block.lines[index].strip })
+      .to eq(["- ❓ Should ls scan both locations?", "- ❗️ Confirm the poll interval."])
+  end
+
+  it "ignores a marker inside a fenced code block" do
+    text = <<~MD
+      <!-- ccmd:turn=1 role=cc -->
+      ## CC — 14:33
+
+      ```markdown
+      - ❓ this is an example, not a question
+      ```
+
+      - ❓ this one is real
+    MD
+
+    block = described_class.call(text).first
+
+    expect(block.prompt_line_indexes(markers).size).to eq(1)
+    expect(block.lines[block.prompt_line_indexes(markers).first]).to include("this one is real")
+  end
+
+  it "fails loudly when a heading has lost its marker comment" do
+    text = "<!-- ccmd:turn=1 role=me -->\n## Me — 14:32\n\nhi\n\n## CC — 14:33\n\nreply\n"
+
+    expect { described_class.call(text) }
+      .to raise_error(described_class::CorruptedError, /line 6/)
+  end
+
+  it "does not mistake a heading inside a fence for a lost marker" do
+    text = "<!-- ccmd:turn=1 role=cc -->\n## CC — 14:33\n\n```\n## Me — 09:00\n```\n"
+
+    expect { described_class.call(text) }.not_to raise_error
+  end
+end
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `bundle exec rspec spec/block_index_spec.rb`
+Expected: FAIL with `uninitialized constant ClaudeCodeMd::BlockIndex`.
+
+- [ ] **Step 3: Implement**
+
+```ruby
+# lib/claude_code_md/block_index.rb
+# frozen_string_literal: true
+
+require_relative "turn_marker"
+
+module ClaudeCodeMd
+  # Splits a conversation into the blocks ccmd wrote, so responses can be
+  # diffed one block at a time. Fence tracking lives here so every consumer
+  # agrees on which lines are prose and which are examples.
+  module BlockIndex
+    class CorruptedError < Error; end
+
+    FENCE = /\A\s*(?:```|~~~)/
+
+    # One turn's contribution to the document. `body` excludes the marker
+    # comment and the heading.
+    Block = Data.define(:turn, :role, :body) do
+      def lines = body.lines
+
+      # Body line indexes that begin a prompt, skipping fenced code.
+      #
+      # @param markers [Markers]
+      def prompt_line_indexes(markers)
+        BlockIndex.outside_fences(lines).select { |index| markers.prompt_marker_for(lines[index]) }
+      end
+    end
+
+    # @return [Array<Block>] in document order
+    def self.call(text)
+      lines = text.lines
+      starts = TurnMarker.scan(text)
+      detect_orphan_headings(lines, starts)
+
+      starts.each_with_index.map do |(line_index, turn, role), position|
+        next_start = starts[position + 1]&.first || lines.size
+        Block.new(turn: turn, role: role, body: lines[(line_index + 2)...next_start].to_a.join)
+      end
+    end
+
+    # @return [Array<Integer>] indexes of lines that are not inside a code fence
+    def self.outside_fences(lines)
+      inside = false
+      lines.each_index.select do |index|
+        if FENCE.match?(lines[index])
+          inside = !inside
+          false
+        else
+          !inside
+        end
+      end
+    end
+
+    # A heading ccmd would have written, with no marker comment above it, means
+    # the file was edited in a way that makes block boundaries unknowable.
+    def self.detect_orphan_headings(lines, starts)
+      expected = starts.map { |(index, _, _)| index + 1 }
+      outside_fences(lines).each do |index|
+        next unless TurnMarker::HEADING_PATTERN.match?(lines[index].chomp)
+        next if expected.include?(index)
+
+        raise CorruptedError, "line #{index + 1}: heading without a ccmd marker comment above it"
+      end
+    end
+    private_class_method :detect_orphan_headings
+  end
+end
+```
+
+Add `require_relative "claude_code_md/block_index"` to `lib/claude_code_md.rb`.
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `bundle exec rake`
+Expected: all pass. RSpec has no `not_include` matcher — if Step 1's compound expectation fails to parse, split it into two `expect` lines rather than inventing a matcher.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lib/claude_code_md.rb lib/claude_code_md/block_index.rb spec/block_index_spec.rb
+git commit -m "feat: split a conversation into ccmd-authored blocks"
+```
+
+---
+
+### Task 6: Inline response detection
+
+The heart of the feature. Two files: a minimal line differ, and the pairing rules that turn its output into responses.
+
+**Files:**
+- Create: `lib/claude_code_md/line_diff.rb`, `lib/claude_code_md/inline_responses.rb`
+- Create: `spec/line_diff_spec.rb`, `spec/inline_responses_spec.rb`
+- Modify: `lib/claude_code_md.rb`
+
+**Interfaces:**
+- Consumes: `BlockIndex::Block`, `Markers`, and any object answering `#snapshot_for(turn:, role:) -> String | nil` and `#consumed?(marker_sha:, response_sha:) -> Boolean` (Task 9 supplies the real one).
+- Produces:
+  - `LineDiff.call(old_lines, new_lines) -> Array<LineDiff::Op>`; `Op#kind` is `:same`, `:add`, or `:del`; `Op#text`; `Op#index` is the position in the new array for `:same` and `:add`, `nil` for `:del`.
+  - `InlineResponses.call(blocks:, state:, markers:) -> InlineResponses::Result`; `Result#responses -> Array<Response>`, `Result#deletions -> Array<Hash>`.
+  - `Response#turn`, `#role`, `#kind` (`:answer`, `:annotation`, `:edit`), `#prompt` (`nil` unless `:answer`), `#text`, `#marker_sha`, `#response_sha`.
+
+- [ ] **Step 1: Write the failing specs**
+
+```ruby
+# spec/line_diff_spec.rb
+# frozen_string_literal: true
+
+RSpec.describe ClaudeCodeMd::LineDiff do
+  def kinds(old_text, new_text)
+    described_class.call(old_text.lines, new_text.lines).map { |op| [op.kind, op.text.chomp] }
+  end
+
+  it "reports untouched lines as same" do
+    expect(kinds("a\nb\n", "a\nb\n")).to eq([[:same, "a"], [:same, "b"]])
+  end
+
+  it "reports an inserted line as an addition" do
+    expect(kinds("a\nb\n", "a\nnew\nb\n")).to eq([[:same, "a"], [:add, "new"], [:same, "b"]])
+  end
+
+  it "reports a removed line as a deletion" do
+    expect(kinds("a\ngone\nb\n", "a\nb\n")).to eq([[:same, "a"], [:del, "gone"], [:same, "b"]])
+  end
+
+  it "reports a changed line as a deletion plus an addition" do
+    expect(kinds("a\nold\n", "a\nnew\n")).to include([:del, "old"], [:add, "new"])
+  end
+
+  it "indexes additions by their position in the new text" do
+    ops = described_class.call("a\n".lines, "a\nsecond\n".lines)
+
+    expect(ops.last.index).to eq(1)
+  end
+
+  it "handles an empty starting point" do
+    expect(kinds("", "only\n")).to eq([[:add, "only"]])
+  end
+end
+```
+
+```ruby
+# spec/inline_responses_spec.rb
+# frozen_string_literal: true
+
+RSpec.describe ClaudeCodeMd::InlineResponses do
+  let(:markers) { ClaudeCodeMd::Markers.from_env({}) }
+
+  # Stands in for ConversationState, which Task 9 builds.
+  let(:state) do
+    Class.new do
+      def initialize(snapshots) = @snapshots = snapshots
+      def snapshot_for(turn:, role:) = @snapshots[[turn, role]]
+      def consumed?(marker_sha:, response_sha:) = false
+    end
+  end
+
+  def snapshot_state(snapshots) = state.new(snapshots)
+
+  def cc_block(body) = ClaudeCodeMd::BlockIndex::Block.new(turn: 3, role: :cc, body: body)
+
+  let(:asked) do
+    <<~MD
+      Two things:
+
+      - ❓ Should ls scan both locations?
+      - ❗️ Confirm the poll interval.
+    MD
+  end
+
+  it "pairs an answer to the question above it" do
+    answered = asked.sub("- ❓ Should ls scan both locations?\n",
+                         "- ❓ Should ls scan both locations?\n  - ✅ Yes\n")
+    result = described_class.call(blocks: [cc_block(answered)],
+                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+
+    expect(result.responses.size).to eq(1)
+    expect(result.responses.first).to have_attributes(
+      turn: 3, role: :cc, kind: :answer,
+      prompt: "- ❓ Should ls scan both locations?", text: "- ✅ Yes"
+    )
+  end
+
+  it "pairs several answers to their own questions" do
+    answered = <<~MD
+      Two things:
+
+      - ❓ Should ls scan both locations?
+        - ✅ Yes
+      - ❗️ Confirm the poll interval.
+        - 💬 200ms, and make it configurable.
+    MD
+    result = described_class.call(blocks: [cc_block(answered)],
+                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+
+    expect(result.responses.map(&:text)).to eq(["- ✅ Yes", "- 💬 200ms, and make it configurable."])
+    expect(result.responses.map { |response| response.prompt[0..4] }).to eq(["- ❓ S", "- ❗️ C"])
+  end
+
+  it "joins several lines under one question into a single response" do
+    answered = asked.sub("- ❗️ Confirm the poll interval.\n",
+                         "- ❗️ Confirm the poll interval.\n  - 💬 200ms\n  - and configurable\n")
+    result = described_class.call(blocks: [cc_block(answered)],
+                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+
+    expect(result.responses.map(&:text)).to eq(["- 💬 200ms\n  - and configurable"])
+  end
+
+  it "accepts a plain indented sentence as a response" do
+    answered = asked.sub("- ❓ Should ls scan both locations?\n",
+                         "- ❓ Should ls scan both locations?\n  yes please\n")
+    result = described_class.call(blocks: [cc_block(answered)],
+                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+
+    expect(result.responses.first.text).to eq("yes please")
+  end
+
+  it "treats a line at column zero as a block-level annotation" do
+    annotated = "#{asked}\nthis whole list is premature\n"
+    result = described_class.call(blocks: [cc_block(annotated)],
+                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+
+    expect(result.responses.first).to have_attributes(kind: :annotation, prompt: nil,
+                                                      text: "this whole list is premature")
+  end
+
+  it "treats a marker the user adds as a new prompt, not an answer" do
+    annotated = "#{asked}- ❗️ also check the trace format\n"
+    result = described_class.call(blocks: [cc_block(annotated)],
+                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+
+    expect(result.responses.first.kind).to eq(:annotation)
+  end
+
+  it "ignores a question inside a fenced code block" do
+    fenced = "#{asked}\n```markdown\n- ❓ an example\n  - ✅ not a real answer\n```\n"
+    result = described_class.call(blocks: [cc_block(fenced)],
+                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+
+    expect(result.responses.map(&:kind)).to all(eq(:annotation))
+    expect(result.responses.none? { |response| response.prompt&.include?("an example") }).to be(true)
+  end
+
+  it "collects answers from two non-adjacent blocks" do
+    first = ClaudeCodeMd::BlockIndex::Block.new(turn: 1, role: :cc, body: "- ❓ one?\n  - ✅ yes\n")
+    second = ClaudeCodeMd::BlockIndex::Block.new(turn: 3, role: :cc, body: "- ❓ two?\n  - ❌ no\n")
+    result = described_class.call(
+      blocks: [first, second],
+      state: snapshot_state([1, :cc] => "- ❓ one?\n", [3, :cc] => "- ❓ two?\n"),
+      markers: markers
+    )
+
+    expect(result.responses.map(&:turn)).to eq([1, 3])
+  end
+
+  it "sends an edit to CC's prose as a diff and reports the deletion" do
+    edited = asked.sub("Two things:", "Two things (I reworded this):")
+    result = described_class.call(blocks: [cc_block(edited)],
+                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+
+    edit = result.responses.find { |response| response.kind == :edit }
+
+    expect(edit.text).to include("-Two things:").and include("+Two things (I reworded this):")
+    expect(result.deletions.map { |deletion| deletion[:text].strip }).to include("Two things:")
+  end
+
+  it "reports a pure deletion without sending a response" do
+    shortened = asked.sub("- ❗️ Confirm the poll interval.\n", "")
+    result = described_class.call(blocks: [cc_block(shortened)],
+                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+
+    expect(result.responses.map(&:kind)).to eq([:edit])
+    expect(result.deletions.size).to eq(1)
+  end
+
+  it "ignores options lines on both sides of the diff" do
+    with_options = asked.sub("- ❓ Should ls scan both locations?\n",
+                             "- ❓ Should ls scan both locations?\n#{markers.options_line(indent: 0)}")
+    result = described_class.call(blocks: [cc_block(with_options)],
+                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+
+    expect(result.responses).to be_empty
+  end
+
+  it "ignores whitespace-only changes" do
+    padded = "#{asked}\n\n"
+    result = described_class.call(blocks: [cc_block(padded)],
+                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+
+    expect(result.responses).to be_empty
+  end
+
+  it "skips a block it has never seen before" do
+    result = described_class.call(blocks: [cc_block(asked)], state: snapshot_state({}), markers: markers)
+
+    expect(result.responses).to be_empty
+  end
+
+  it "skips a response already recorded as consumed" do
+    consuming_state = Class.new do
+      def snapshot_for(turn:, role:) = "- ❓ Should ls scan both locations?\n"
+      def consumed?(marker_sha:, response_sha:) = true
+    end
+    block = cc_block("- ❓ Should ls scan both locations?\n  - ✅ Yes\n")
+
+    result = described_class.call(blocks: [block], state: consuming_state.new, markers: markers)
+
+    expect(result.responses).to be_empty
+  end
+end
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `bundle exec rspec spec/line_diff_spec.rb spec/inline_responses_spec.rb`
+Expected: FAIL with `uninitialized constant ClaudeCodeMd::LineDiff`.
+
+- [ ] **Step 3: Implement the differ**
+
+```ruby
+# lib/claude_code_md/line_diff.rb
+# frozen_string_literal: true
+
+module ClaudeCodeMd
+  # A line-based diff, which the standard library does not provide. Block bodies
+  # are tens of lines, so the quadratic table costs nothing here.
+  module LineDiff
+    # @param index [Integer, nil] position in the new array; nil for a deletion
+    Op = Data.define(:kind, :text, :index)
+
+    # @return [Array<Op>] in new-document order
+    def self.call(old_lines, new_lines)
+      table = lcs_table(old_lines, new_lines)
+      ops = []
+      row = old_lines.size
+      col = new_lines.size
+
+      while row.positive? || col.positive?
+        if row.positive? && col.positive? && old_lines[row - 1] == new_lines[col - 1]
+          ops.unshift(Op.new(kind: :same, text: new_lines[col - 1], index: col - 1))
+          row -= 1
+          col -= 1
+        elsif col.positive? && (row.zero? || table[row][col - 1] >= table[row - 1][col])
+          ops.unshift(Op.new(kind: :add, text: new_lines[col - 1], index: col - 1))
+          col -= 1
+        else
+          ops.unshift(Op.new(kind: :del, text: old_lines[row - 1], index: nil))
+          row -= 1
+        end
+      end
+
+      ops
+    end
+
+    def self.lcs_table(old_lines, new_lines)
+      table = Array.new(old_lines.size + 1) { Array.new(new_lines.size + 1, 0) }
+
+      old_lines.each_index do |row|
+        new_lines.each_index do |col|
+          table[row + 1][col + 1] = if old_lines[row] == new_lines[col]
+                                      table[row][col] + 1
+                                    else
+                                      [table[row][col + 1], table[row + 1][col]].max
+                                    end
+        end
+      end
+
+      table
+    end
+    private_class_method :lcs_table
+  end
+end
+```
+
+- [ ] **Step 4: Implement the pairing rules**
+
+```ruby
+# lib/claude_code_md/inline_responses.rb
+# frozen_string_literal: true
+
+require "digest"
+
+require_relative "block_index"
+require_relative "line_diff"
+
+module ClaudeCodeMd
+  # Finds what the user wrote into blocks ccmd had already written, and pairs
+  # each addition to the prompt it sits beneath.
+  module InlineResponses
+    # @param kind [Symbol] :answer, :annotation, or :edit
+    # @param prompt [String, nil] the marker line being answered, nil otherwise
+    Response = Data.define(:turn, :role, :kind, :prompt, :text, :marker_sha, :response_sha)
+
+    Result = Data.define(:responses, :deletions)
+
+    def self.call(blocks:, state:, markers:)
+      responses = []
+      deletions = []
+
+      blocks.each do |block|
+        snapshot = state.snapshot_for(turn: block.turn, role: block.role)
+        next if snapshot.nil?
+
+        diff_block(block, snapshot, markers, responses, deletions)
+      end
+
+      Result.new(responses: reject_consumed(responses, state), deletions: deletions)
+    end
+
+    def self.diff_block(block, snapshot, markers, responses, deletions)
+      old_lines = markers.strip_options(snapshot).lines
+      new_lines = markers.strip_options(block.body).lines
+      return if old_lines == new_lines
+
+      ops = LineDiff.call(old_lines, new_lines)
+      additions = ops.select { |op| op.kind == :add && !op.text.strip.empty? }
+      removals = ops.select { |op| op.kind == :del && !op.text.strip.empty? }
+
+      responses.concat(pair_additions(block, new_lines, additions, markers))
+      return if removals.empty?
+
+      deletions.concat(removals.map { |op| { turn: block.turn, role: block.role, text: op.text } })
+      responses << edit_response(block, ops)
+    end
+
+    # Walk upward from each addition to the nearest prompt line indented less
+    # than it is. Additions sharing a prompt are joined in document order.
+    def self.pair_additions(block, new_lines, additions, markers)
+      prompt_indexes = BlockIndex.outside_fences(new_lines)
+                                 .select { |index| markers.prompt_marker_for(new_lines[index]) }
+      added_indexes = additions.map(&:index)
+
+      additions.group_by { |op| prompt_for(op, prompt_indexes, added_indexes, new_lines) }
+               .map { |prompt_index, ops| build_response(block, new_lines, prompt_index, ops) }
+    end
+
+    def self.prompt_for(addition, prompt_indexes, added_indexes, new_lines)
+      indent = leading_width(addition.text)
+      return nil if indent.zero?
+
+      prompt_indexes.reverse.find do |index|
+        # A prompt the user just added is a new question, not something to answer.
+        next false if added_indexes.include?(index)
+
+        index < addition.index && leading_width(new_lines[index]) < indent
+      end
+    end
+
+    def self.build_response(block, new_lines, prompt_index, ops)
+      prompt = prompt_index && new_lines[prompt_index].chomp
+      text = ops.sort_by(&:index).map { |op| op.text.chomp }.join("\n")
+
+      Response.new(turn: block.turn, role: block.role,
+                   kind: prompt ? :answer : :annotation,
+                   prompt: prompt, text: text,
+                   marker_sha: sha(prompt.to_s), response_sha: sha(text))
+    end
+
+    def self.edit_response(block, ops)
+      text = ops.reject { |op| op.kind == :same }.map do |op|
+        "#{op.kind == :add ? "+" : "-"}#{op.text.chomp}"
+      end.join("\n")
+
+      Response.new(turn: block.turn, role: block.role, kind: :edit, prompt: nil,
+                   text: text, marker_sha: sha("edit"), response_sha: sha(text))
+    end
+
+    def self.reject_consumed(responses, state)
+      responses.reject do |response|
+        state.consumed?(marker_sha: response.marker_sha, response_sha: response.response_sha)
+      end
+    end
+
+    def self.leading_width(line) = line[/\A[ \t]*/].length
+    def self.sha(text) = Digest::SHA256.hexdigest(text)
+
+    private_class_method :diff_block, :pair_additions, :prompt_for, :build_response,
+                         :edit_response, :reject_consumed, :leading_width, :sha
+  end
+end
+```
+
+Add `require_relative "claude_code_md/line_diff"` and `require_relative "claude_code_md/inline_responses"` to `lib/claude_code_md.rb`.
+
+- [ ] **Step 5: Run to verify they pass**
+
+Run: `bundle exec rake`
+Expected: all pass. The fenced-example spec is the one most likely to need adjustment — additions inside a fence still count as additions, they simply cannot pair to a fenced prompt, so they arrive as annotations.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add lib/claude_code_md.rb lib/claude_code_md/line_diff.rb lib/claude_code_md/inline_responses.rb spec/line_diff_spec.rb spec/inline_responses_spec.rb
+git commit -m "feat: detect answers written beneath CC's questions"
+```
+
+---
+
+### Task 7: Turn composer
+
+**Files:**
+- Create: `lib/claude_code_md/turn_composer.rb`
+- Create: `spec/turn_composer_spec.rb`
+- Modify: `lib/claude_code_md.rb`
+
+**Interfaces:**
+- Consumes: `InlineResponses::Response`.
+- Produces: `TurnComposer.call(responses:, trailing_text:) -> String`, empty when there is nothing to send.
+
+The prompt text is quoted back so CC never has to re-read the file to know what is being answered.
+
+- [ ] **Step 1: Write the failing spec**
+
+```ruby
+# spec/turn_composer_spec.rb
+# frozen_string_literal: true
+
+RSpec.describe ClaudeCodeMd::TurnComposer do
+  def response(kind:, text:, prompt: nil, turn: 3)
+    ClaudeCodeMd::InlineResponses::Response.new(
+      turn: turn, role: :cc, kind: kind, prompt: prompt, text: text,
+      marker_sha: "m", response_sha: "r"
+    )
+  end
+
+  it "returns an empty string when there is nothing to send" do
+    expect(described_class.call(responses: [], trailing_text: "  \n")).to eq("")
+  end
+
+  it "sends the trailing text alone when there are no responses" do
+    expect(described_class.call(responses: [], trailing_text: "just a question"))
+      .to eq("[new message]\n\njust a question")
+  end
+
+  it "sends responses alone when the trailing block is empty" do
+    payload = described_class.call(
+      responses: [response(kind: :answer, prompt: "- ❓ Should ls scan both?", text: "- ✅ Yes")],
+      trailing_text: ""
+    )
+
+    expect(payload).to eq("[inline responses]\n\nturn 3 · ❓ Should ls scan both?\n  - ✅ Yes")
+  end
+
+  it "quotes the prompt without its list bullet" do
+    payload = described_class.call(
+      responses: [response(kind: :answer, prompt: "  - ❗️ Confirm the interval.", text: "- 💬 200ms")],
+      trailing_text: ""
+    )
+
+    expect(payload).to include("turn 3 · ❗️ Confirm the interval.")
+  end
+
+  it "labels annotations and edits" do
+    payload = described_class.call(
+      responses: [response(kind: :annotation, text: "this list is premature"),
+                  response(kind: :edit, text: "-old\n+new")],
+      trailing_text: ""
+    )
+
+    expect(payload).to include("turn 3 · annotation").and include("turn 3 · edit to text ccmd wrote")
+  end
+
+  it "indents multi-line response text" do
+    payload = described_class.call(
+      responses: [response(kind: :annotation, text: "first\nsecond")], trailing_text: ""
+    )
+
+    expect(payload).to include("  first\n  second")
+  end
+
+  it "puts both sections in order when both exist" do
+    payload = described_class.call(
+      responses: [response(kind: :answer, prompt: "- ❓ one?", text: "- ✅ Yes")],
+      trailing_text: "Also bump the poll interval."
+    )
+
+    expect(payload).to eq(<<~PAYLOAD.strip)
+      [inline responses]
+
+      turn 3 · ❓ one?
+        - ✅ Yes
+
+      [new message]
+
+      Also bump the poll interval.
+    PAYLOAD
+  end
+end
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `bundle exec rspec spec/turn_composer_spec.rb`
+Expected: FAIL with `uninitialized constant ClaudeCodeMd::TurnComposer`.
+
+- [ ] **Step 3: Implement**
+
+```ruby
+# lib/claude_code_md/turn_composer.rb
+# frozen_string_literal: true
+
+module ClaudeCodeMd
+  # Merges inline responses and the trailing block's text into the single
+  # message a turn sends. Only the parts that exist appear.
+  module TurnComposer
+    INLINE_HEADER = "[inline responses]"
+    MESSAGE_HEADER = "[new message]"
+    LIST_BULLET = /\A\s*(?:[-*+]|\d+[.)])\s+/
+
+    def self.call(responses:, trailing_text:)
+      sections = []
+      sections << "#{INLINE_HEADER}\n\n#{render(responses)}" unless responses.empty?
+      sections << "#{MESSAGE_HEADER}\n\n#{trailing_text.to_s.strip}" unless blank?(trailing_text)
+      sections.join("\n\n")
+    end
+
+    def self.render(responses)
+      responses.map { |response| "#{heading(response)}\n#{indent(response.text)}" }.join("\n\n")
+    end
+
+    def self.heading(response)
+      case response.kind
+      when :answer then "turn #{response.turn} · #{response.prompt.sub(LIST_BULLET, "")}"
+      when :edit then "turn #{response.turn} · edit to text ccmd wrote"
+      else "turn #{response.turn} · annotation"
+      end
+    end
+
+    def self.indent(text) = text.lines.map { |line| "  #{line.chomp}" }.join("\n")
+    def self.blank?(text) = text.to_s.strip.empty?
+
+    private_class_method :render, :heading, :indent, :blank?
+  end
+end
+```
+
+Add `require_relative "claude_code_md/turn_composer"` to `lib/claude_code_md.rb`.
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `bundle exec rake`
+Expected: all pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lib/claude_code_md.rb lib/claude_code_md/turn_composer.rb spec/turn_composer_spec.rb
+git commit -m "feat: compose inline responses and typed text into one turn"
+```
+
+---
+
+### Task 8: Event codec
 
 **Files:**
 - Create: `lib/claude_code_md/event_codec.rb`
@@ -405,10 +1444,7 @@ git commit -m "feat: extract the pending user turn from a conversation"
 
 **Interfaces:**
 - Consumes: fixtures from Task 1.
-- Produces:
-  - `EventCodec.encode_user(String, session_id:) -> String` (one JSON line, no newline).
-  - `EventCodec.decode(String) -> EventCodec::Event | nil` (`nil` on unparseable input).
-  - `EventCodec::Event` with readers `type`, `subtype`, `raw` and methods `text_delta`, `thinking_delta`, `tool_uses`, `tool_results`, `session_id`, `result?`, `error?`, `duration_ms`, `total_cost_usd`, `num_turns`.
+- Produces: `EventCodec.encode_user(String, session_id:) -> String` (one line, no newline); `EventCodec.decode(String) -> Event | nil`; `Event#type`, `#subtype`, `#raw`, `#text_delta`, `#thinking_delta`, `#tool_uses`, `#tool_results`, `#session_id`, `#result?`, `#error?`, `#duration_ms`, `#num_turns`, `#total_cost_usd`.
 
 - [ ] **Step 1: Write the failing spec**
 
@@ -435,11 +1471,12 @@ RSpec.describe ClaudeCodeMd::EventCodec do
       )
     end
 
-    it "escapes newlines and quotes in prose" do
-      line = described_class.encode_user("line one\n\n\"quoted\"", session_id: "abc-123")
+    it "escapes newlines and quotes so a composed payload survives" do
+      payload = "[inline responses]\n\nturn 3 · ❓ \"quoted\"\n  - ✅ Yes"
+      line = described_class.encode_user(payload, session_id: "abc-123")
 
       expect(line).not_to include("\n")
-      expect(JSON.parse(line).dig("message", "content", 0, "text")).to eq("line one\n\n\"quoted\"")
+      expect(JSON.parse(line).dig("message", "content", 0, "text")).to eq(payload)
     end
   end
 
@@ -487,8 +1524,8 @@ Expected: FAIL with `uninitialized constant ClaudeCodeMd::EventCodec`.
 require "json"
 
 module ClaudeCodeMd
-  # Translates between CC's stream-json protocol and plain Ruby values. Pure:
-  # it touches neither the filesystem nor the child process.
+  # Translates between CC's stream-json protocol and plain Ruby values. Pure: it
+  # touches neither the filesystem nor the child process.
   module EventCodec
     # One decoded line of CC stdout. `raw` is kept so unmodeled fields stay
     # reachable without widening this class.
@@ -525,7 +1562,7 @@ module ClaudeCodeMd
       end
     end
 
-    # @param text [String] the user's prose, which may contain newlines
+    # @param text [String] the composed payload, which may contain newlines
     def self.encode_user(text, session_id:)
       JSON.generate(
         type: "user",
@@ -553,7 +1590,7 @@ Add `require_relative "claude_code_md/event_codec"` to `lib/claude_code_md.rb`.
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `bundle exec rake`
-Expected: all pass. If the thinking delta type in `spec/fixtures/README.md` differs from `thinking_delta`, change the string in `thinking_delta` to match the fixture and note it in a comment.
+Expected: all pass. If the thinking delta type recorded in the fixtures README differs from `thinking_delta`, change the string here to match it and note why in a comment.
 
 - [ ] **Step 5: Commit**
 
@@ -564,7 +1601,253 @@ git commit -m "feat: encode and decode the CC stream-json protocol"
 
 ---
 
-### Task 5: Conversation file
+### Task 9: Conversation state
+
+**Files:**
+- Create: `lib/claude_code_md/conversation_state.rb`
+- Create: `spec/conversation_state_spec.rb`
+- Modify: `lib/claude_code_md.rb`
+
+**Interfaces:**
+- Consumes: `BlockIndex::Block`, `InlineResponses::Response`, `Markers#strip_options`.
+- Produces: `ConversationState.load(path:, blocks:, markers:) -> ConversationState`; `#snapshot_for(turn:, role:) -> String | nil`; `#consumed?(marker_sha:, response_sha:) -> Boolean`; `#mark_consumed(responses)`; `#advance(blocks)`; `#save`; `#path`; raises `ConversationState::VersionError` for a state file from a newer version.
+
+This is the one file ccmd rewrites wholesale, which is safe because the user never has it open. Writes go to a temporary file in the same directory and are renamed into place, so a crash mid-write leaves the previous state intact.
+
+A missing state file is recoverable: snapshots seed from the current blocks, which makes everything already-consumed and produces no spurious resend.
+
+- [ ] **Step 1: Write the failing spec**
+
+```ruby
+# spec/conversation_state_spec.rb
+# frozen_string_literal: true
+
+require "tmpdir"
+
+RSpec.describe ClaudeCodeMd::ConversationState do
+  around do |example|
+    Dir.mktmpdir { |dir| @dir = dir and example.run }
+  end
+
+  let(:markers) { ClaudeCodeMd::Markers.from_env({}) }
+  let(:path) { File.join(@dir, "c.state.json") }
+
+  def block(turn:, role:, body:) = ClaudeCodeMd::BlockIndex::Block.new(turn: turn, role: role, body: body)
+
+  def response(marker_sha:, response_sha:)
+    ClaudeCodeMd::InlineResponses::Response.new(
+      turn: 1, role: :cc, kind: :answer, prompt: "- ❓ q", text: "- ✅ y",
+      marker_sha: marker_sha, response_sha: response_sha
+    )
+  end
+
+  def load(blocks) = described_class.load(path: path, blocks: blocks, markers: markers)
+
+  it "seeds snapshots from the current blocks when there is no state file" do
+    state = load([block(turn: 1, role: :cc, body: "- ❓ q\n")])
+
+    expect(state.snapshot_for(turn: 1, role: :cc)).to eq("- ❓ q\n")
+  end
+
+  it "returns nil for a block it has no snapshot of" do
+    expect(load([]).snapshot_for(turn: 9, role: :cc)).to be_nil
+  end
+
+  it "strips options lines from stored snapshots" do
+    body = "- ❓ q\n#{markers.options_line(indent: 0)}"
+    state = load([block(turn: 1, role: :cc, body: body)])
+
+    expect(state.snapshot_for(turn: 1, role: :cc)).to eq("- ❓ q\n")
+  end
+
+  it "persists snapshots across a save and reload" do
+    load([block(turn: 1, role: :cc, body: "original\n")]).save
+    reloaded = load([block(turn: 1, role: :cc, body: "edited by hand\n")])
+
+    expect(reloaded.snapshot_for(turn: 1, role: :cc)).to eq("original\n")
+  end
+
+  it "advances snapshots to the current blocks" do
+    state = load([block(turn: 1, role: :cc, body: "original\n")])
+    state.advance([block(turn: 1, role: :cc, body: "answered\n")])
+
+    expect(state.snapshot_for(turn: 1, role: :cc)).to eq("answered\n")
+  end
+
+  it "remembers a consumed response by both hashes" do
+    state = load([])
+    state.mark_consumed([response(marker_sha: "m1", response_sha: "r1")])
+
+    expect(state.consumed?(marker_sha: "m1", response_sha: "r1")).to be(true)
+    expect(state.consumed?(marker_sha: "m1", response_sha: "r2")).to be(false)
+  end
+
+  it "persists consumed entries across a reload" do
+    state = load([])
+    state.mark_consumed([response(marker_sha: "m1", response_sha: "r1")])
+    state.save
+
+    expect(load([]).consumed?(marker_sha: "m1", response_sha: "r1")).to be(true)
+  end
+
+  it "writes atomically, leaving no temporary file behind" do
+    load([]).save
+
+    expect(Dir.children(@dir)).to eq(["c.state.json"])
+  end
+
+  it "ignores a temporary file left by an interrupted write" do
+    File.write("#{path}.tmp", "{ this is not valid json")
+    state = load([block(turn: 1, role: :cc, body: "body\n")])
+
+    expect(state.snapshot_for(turn: 1, role: :cc)).to eq("body\n")
+  end
+
+  it "refuses a state file from a newer version rather than misreading it" do
+    File.write(path, JSON.generate("version" => described_class::VERSION + 1, "blocks" => []))
+
+    expect { load([]) }.to raise_error(described_class::VersionError, /version/)
+  end
+
+  it "treats a corrupt state file as missing" do
+    File.write(path, "{ truncated")
+    state = load([block(turn: 1, role: :cc, body: "body\n")])
+
+    expect(state.snapshot_for(turn: 1, role: :cc)).to eq("body\n")
+  end
+end
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `bundle exec rspec spec/conversation_state_spec.rb`
+Expected: FAIL with `uninitialized constant ClaudeCodeMd::ConversationState`.
+
+- [ ] **Step 3: Implement**
+
+```ruby
+# lib/claude_code_md/conversation_state.rb
+# frozen_string_literal: true
+
+require "json"
+require "pathname"
+
+module ClaudeCodeMd
+  # Snapshots of every block as ccmd last saw it, plus the responses already
+  # sent. Diffing a block against its snapshot is how an answer written under a
+  # question gets noticed.
+  #
+  # Consumed entries are keyed by marker hash *and* response hash: marker alone
+  # would suppress a corrected answer, response alone would confuse identical
+  # answers to different questions.
+  class ConversationState
+    class VersionError < Error; end
+
+    VERSION = 1
+
+    attr_reader :path
+
+    # A missing or unreadable state file is not fatal — snapshots seed from the
+    # current blocks, so nothing diffs as new and nothing is re-sent.
+    def self.load(path:, blocks:, markers:)
+      stored = read(Pathname.new(path))
+      raise VersionError, "state file version #{stored["version"]} is newer than #{VERSION}" if newer?(stored)
+
+      new(path: path, markers: markers,
+          snapshots: stored ? snapshots_from(stored) : seed(blocks, markers),
+          consumed: stored ? consumed_from(stored) : [])
+    end
+
+    def self.read(path)
+      return nil unless path.exist?
+
+      parsed = JSON.parse(path.read)
+      parsed.is_a?(Hash) ? parsed : nil
+    rescue JSON::ParserError
+      nil
+    end
+
+    def self.newer?(stored) = stored && stored["version"].to_i > VERSION
+
+    def self.snapshots_from(stored)
+      Array(stored["blocks"]).to_h { |entry| [[entry["turn"], entry["role"].to_sym], entry["text"].to_s] }
+    end
+
+    def self.consumed_from(stored)
+      Array(stored["consumed"]).map { |entry| [entry["marker_sha256"], entry["response_sha256"]] }
+    end
+
+    def self.seed(blocks, markers)
+      blocks.to_h { |block| [[block.turn, block.role], markers.strip_options(block.body)] }
+    end
+
+    private_class_method :read, :newer?, :snapshots_from, :consumed_from, :seed
+
+    def initialize(path:, markers:, snapshots: {}, consumed: [])
+      @path = Pathname.new(path)
+      @markers = markers
+      @snapshots = snapshots
+      @consumed = consumed
+    end
+
+    # @return [String, nil] nil when this block has never been snapshotted
+    def snapshot_for(turn:, role:) = @snapshots[[turn, role]]
+
+    def consumed?(marker_sha:, response_sha:) = @consumed.include?([marker_sha, response_sha])
+
+    def mark_consumed(responses)
+      responses.each { |response| @consumed << [response.marker_sha, response.response_sha] }
+      @consumed.uniq!
+      self
+    end
+
+    # Called at turn end, when the file is quiescent. Anything added while a
+    # turn streamed is therefore picked up on the following send.
+    def advance(blocks)
+      blocks.each { |block| @snapshots[[block.turn, block.role]] = @markers.strip_options(block.body) }
+      self
+    end
+
+    def save
+      temporary = @path.dirname.join("#{@path.basename}.tmp")
+      @path.dirname.mkpath
+      temporary.write("#{JSON.pretty_generate(document)}\n")
+      temporary.rename(@path.to_s)
+      self
+    end
+
+    private
+
+    def document
+      { "version" => VERSION,
+        "blocks" => @snapshots.map do |(turn, role), text|
+          { "turn" => turn, "role" => role.to_s, "text" => text }
+        end,
+        "consumed" => @consumed.map do |(marker_sha, response_sha)|
+          { "marker_sha256" => marker_sha, "response_sha256" => response_sha }
+        end }
+    end
+  end
+end
+```
+
+Add `require_relative "claude_code_md/conversation_state"` to `lib/claude_code_md.rb`.
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `bundle exec rake`
+Expected: all pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lib/claude_code_md.rb lib/claude_code_md/conversation_state.rb spec/conversation_state_spec.rb
+git commit -m "feat: snapshot blocks and remember consumed responses"
+```
+
+---
+
+### Task 10: Conversation file
 
 **Files:**
 - Create: `lib/claude_code_md/conversation_file.rb`
@@ -572,8 +1855,8 @@ git commit -m "feat: encode and decode the CC stream-json protocol"
 - Modify: `lib/claude_code_md.rb`
 
 **Interfaces:**
-- Consumes: `Frontmatter`, `TurnMarker`, `DeltaExtractor`.
-- Produces: `ConversationFile.new(path)` with `#path`, `#exist?`, `#create(session_id:, cwd:, model:, permission_mode:, now:)`, `#frontmatter`, `#read`, `#pending_text`, `#open_turn(role:, now:)`, `#append(text)`, `#append_note(text)`, `#trace_path`.
+- Consumes: `Frontmatter`, `TurnMarker`, `DeltaExtractor`, `BlockIndex`.
+- Produces: `ConversationFile.new(path)` with `#path`, `#exist?`, `#read`, `#frontmatter`, `#pending_text`, `#blocks`, `#trace_path`, `#state_path`, `#create(session_id:, cwd:, model:, permission_mode:, now:)`, `#open_turn(role:, now:)`, `#append(text)`, `#append_note(text)`.
 
 - [ ] **Step 1: Write the failing spec**
 
@@ -638,8 +1921,17 @@ RSpec.describe ClaudeCodeMd::ConversationFile do
     expect(file.pending_text).to eq("what is this")
   end
 
-  it "derives the trace path from the conversation path" do
+  it "exposes its blocks" do
+    created
+    file.append("a question\n")
+    file.open_turn(role: :cc, now: now)
+
+    expect(file.blocks.map(&:role)).to eq(%i[me cc])
+  end
+
+  it "derives sibling paths from the conversation path" do
     expect(file.trace_path.to_s).to eq(File.join(@dir, "nested", "conversation.trace.md"))
+    expect(file.state_path.to_s).to eq(File.join(@dir, "nested", "conversation.state.json"))
   end
 
   it "formats a note as a blockquote" do
@@ -664,6 +1956,7 @@ Expected: FAIL with `uninitialized constant ClaudeCodeMd::ConversationFile`.
 
 require "pathname"
 
+require_relative "block_index"
 require_relative "delta_extractor"
 require_relative "frontmatter"
 require_relative "turn_marker"
@@ -683,7 +1976,9 @@ module ClaudeCodeMd
     def read = path.read
     def frontmatter = Frontmatter.parse(read)
     def pending_text = DeltaExtractor.call(read)
+    def blocks = BlockIndex.call(read)
     def trace_path = path.sub_ext(".trace.md")
+    def state_path = path.sub_ext(".state.json")
 
     # Creates the file with frontmatter and an opening user turn. A file that
     # already exists is left exactly as it is.
@@ -743,7 +2038,7 @@ git commit -m "feat: append-only conversation file"
 
 ---
 
-### Task 6: Trace file
+### Task 11: Trace file
 
 **Files:**
 - Create: `lib/claude_code_md/trace_file.rb`
@@ -752,9 +2047,9 @@ git commit -m "feat: append-only conversation file"
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `TraceFile.new(path)` with `#start_turn(turn:, now:)`, `#append(text)`, `#tool_use(name:, input:)`, `#tool_result(content:, max_bytes:)`, `#finish_turn(duration_ms:, num_turns:, total_cost_usd:)`, `#anchor(turn)`.
+- Produces: `TraceFile.new(path)` with `#path`, `#read`, `#anchor(turn)`, `#start_turn(turn:, now:)`, `#append(text)`, `#record_payload(text)`, `#tool_use(name:, input:)`, `#tool_result(content:, max_bytes:)`, `#finish_turn(duration_ms:, num_turns:, total_cost_usd:)`.
 
-Formatting decisions live here so `TranscriptRenderer` stays about routing.
+Recording the composed payload verbatim is what makes "what did ccmd actually send?" answerable without guessing.
 
 - [ ] **Step 1: Write the failing spec**
 
@@ -777,6 +2072,13 @@ RSpec.describe ClaudeCodeMd::TraceFile do
 
     expect(trace.read).to include("## Turn 3 — 14:33")
     expect(trace.anchor(3)).to eq("#turn-3")
+  end
+
+  it "records the composed payload verbatim in a collapsed block" do
+    trace.record_payload("[inline responses]\n\nturn 3 · ❓ one?\n  - ✅ Yes")
+
+    expect(trace.read).to include("<details><summary>Sent</summary>")
+    expect(trace.read).to include("turn 3 · ❓ one?")
   end
 
   it "records a tool use with its input" do
@@ -825,12 +2127,14 @@ Expected: FAIL with `uninitialized constant ClaudeCodeMd::TraceFile`.
 # lib/claude_code_md/trace_file.rb
 # frozen_string_literal: true
 
+require "json"
 require "pathname"
 
 module ClaudeCodeMd
-  # The sibling document holding thinking and tool activity. Tool results are
-  # recorded in full by default: the trace is built from output CC already
-  # streamed, is never read back into a session, and so costs no tokens.
+  # The sibling document holding what was sent, what CC thought, and what its
+  # tools did. Tool results are recorded in full by default: the trace is built
+  # from output CC already streamed, is never read back into a session, and so
+  # costs no tokens.
   class TraceFile
     attr_reader :path
 
@@ -850,6 +2154,10 @@ module ClaudeCodeMd
       path.open("a") { |io| io.write(text) }
     end
 
+    def record_payload(text)
+      append("<details><summary>Sent</summary>\n\n```\n#{text}\n```\n\n</details>\n\n")
+    end
+
     def tool_use(name:, input:)
       append("### `#{name}`\n\n```json\n#{JSON.pretty_generate(input)}\n```\n\n")
     end
@@ -857,10 +2165,9 @@ module ClaudeCodeMd
     # @param max_bytes [Integer, nil] nil records the whole result
     def tool_result(content:, max_bytes: nil)
       body = content.to_s
-      summary = "Result — #{body.lines.size} #{body.lines.size == 1 ? "line" : "lines"}"
-      if max_bytes && body.bytesize > max_bytes
-        body = "#{body.byteslice(0, max_bytes)}\n… truncated at #{max_bytes} bytes"
-      end
+      count = body.lines.size
+      summary = "Result — #{count} #{count == 1 ? "line" : "lines"}"
+      body = "#{body.byteslice(0, max_bytes)}\n… truncated at #{max_bytes} bytes" if truncate?(body, max_bytes)
 
       append("<details><summary>#{summary}</summary>\n\n```\n#{body}\n```\n\n</details>\n\n")
     end
@@ -872,11 +2179,15 @@ module ClaudeCodeMd
 
       append("#{parts.join(" · ")}\n\n")
     end
+
+    private
+
+    def truncate?(body, max_bytes) = max_bytes && body.bytesize > max_bytes
   end
 end
 ```
 
-Add `require "json"` at the top of the file and `require_relative "claude_code_md/trace_file"` to `lib/claude_code_md.rb`.
+Add `require_relative "claude_code_md/trace_file"` to `lib/claude_code_md.rb`.
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -887,12 +2198,12 @@ Expected: all pass.
 
 ```bash
 git add lib/claude_code_md.rb lib/claude_code_md/trace_file.rb spec/trace_file_spec.rb
-git commit -m "feat: trace file for thinking and tool activity"
+git commit -m "feat: trace what was sent, thought, and run"
 ```
 
 ---
 
-### Task 7: Send gate
+### Task 12: Send gate
 
 **Files:**
 - Create: `lib/claude_code_md/send_gate.rb`
@@ -901,7 +2212,9 @@ git commit -m "feat: trace file for thinking and tool activity"
 
 **Interfaces:**
 - Consumes: `DeltaExtractor::SEND_TOKEN`.
-- Produces: `SendGate.new(conversation_path)` with `#poll -> :sidecar | :token | nil` and `#sidecar_path`.
+- Produces: `SendGate.new(conversation_path)` with `#poll -> :sidecar | :token | nil` and `#sidecar_path -> Pathname`.
+
+A token-triggered send keeps matching until something is appended after it, so `Session` must open the CC turn before polling again. That ordering is asserted in Task 18.
 
 - [ ] **Step 1: Write the failing spec**
 
@@ -947,6 +2260,13 @@ RSpec.describe ClaudeCodeMd::SendGate do
     expect(gate.poll).to be_nil
   end
 
+  it "fires on a sidecar even when the trailing block is empty" do
+    File.write(path, "<!-- ccmd:turn=2 role=me -->\n## Me — 14:41\n\n")
+    FileUtils.touch("#{path}.send")
+
+    expect(gate.poll).to eq(:sidecar)
+  end
+
   it "stays quiet when the conversation does not exist yet" do
     expect(gate.poll).to be_nil
   end
@@ -972,16 +2292,11 @@ module ClaudeCodeMd
   # Decides whether the user meant to send. Saving is not a signal — it happens
   # constantly — so the gate looks only for deliberate acts: the sidecar that
   # cmd+enter touches, or a send token typed as the final line.
-  #
-  # A token-triggered send keeps firing until the caller appends something after
-  # it, so callers must open the CC turn before polling again.
   class SendGate
     def initialize(conversation_path)
       @conversation = Pathname.new(conversation_path)
       @sidecar = Pathname.new("#{conversation_path}.send")
     end
-
-    attr_reader :sidecar_path
 
     def sidecar_path = @sidecar
 
@@ -1007,8 +2322,6 @@ module ClaudeCodeMd
 end
 ```
 
-Remove the stray `attr_reader :sidecar_path` line if RuboCop flags the duplicate definition — the endless method below it is the one to keep.
-
 Add `require_relative "claude_code_md/send_gate"` to `lib/claude_code_md.rb`.
 
 - [ ] **Step 4: Run to verify it passes**
@@ -1025,7 +2338,7 @@ git commit -m "feat: gate sends on deliberate intent, not on save"
 
 ---
 
-### Task 8: Location resolution
+### Task 13: Location resolution
 
 **Files:**
 - Create: `lib/claude_code_md/location.rb`
@@ -1034,9 +2347,9 @@ git commit -m "feat: gate sends on deliberate intent, not on save"
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `Location.resolve(target, dir:, shape:, env:, cwd:, now:) -> Pathname` and `Location.directories(env:, cwd:) -> {repo: Pathname|nil, global: Pathname}`.
+- Produces: `Location.resolve(target, dir:, shape:, env:, cwd:, now:) -> Pathname`; `Location.directories(env:, cwd:) -> {repo: Pathname | nil, global: Pathname}`; `Location.repo_root(cwd) -> Pathname | nil`.
 
-Resolution order and defaults are specified in the design's Conversation Location section. Implement exactly that table.
+Implement exactly the resolution table in the base design's Conversation Location section.
 
 - [ ] **Step 1: Write the failing spec**
 
@@ -1083,9 +2396,7 @@ RSpec.describe ClaudeCodeMd::Location do
   it "falls back to the global directory outside a repo" do
     result = described_class.resolve("flaky-spec", env: env, cwd: @dir, now: now)
 
-    expect(result.to_s).to eq(
-      File.join(@dir, "trunk/docs/conversations", "conversation.8_5_2026.flaky_spec.md")
-    )
+    expect(result.to_s).to eq(File.join(@dir, "trunk/docs/conversations", "conversation.8_5_2026.flaky_spec.md"))
   end
 
   it "forces the global shape when asked" do
@@ -1099,6 +2410,14 @@ RSpec.describe ClaudeCodeMd::Location do
     result = described_class.resolve("x", env: custom, cwd: repo_with_nested_dir, now: now)
 
     expect(result.to_s).to eq(File.join(@dir, "repo", "tmp/chats", "conversation.8_5_2026.x.md"))
+  end
+
+  it "finds the repo root from a nested directory" do
+    expect(described_class.repo_root(repo_with_nested_dir).to_s).to eq(File.join(@dir, "repo"))
+  end
+
+  it "returns nil for a repo root outside a repository" do
+    expect(described_class.repo_root(@dir)).to be_nil
   end
 end
 ```
@@ -1118,14 +2437,14 @@ require "pathname"
 
 module ClaudeCodeMd
   # Works out which file a conversation argument refers to. A path is used as
-  # given; a bare slug is resolved inside either a repo-relative or a global
+  # given; a bare slug resolves inside either a repo-relative or a global
   # directory, both configurable.
   module Location
     DEFAULT_REPO_SUBDIR = "docs/agent-local/conversations"
     DEFAULT_GLOBAL_SUBPATH = "trunk/docs/conversations"
 
     # @param target [String] a path or a slug
-    # @param dir [String, nil] explicit directory, wins over every other source
+    # @param dir [String, nil] explicit directory, which wins over every other source
     # @param shape [Symbol, nil] :repo or :global, forced by flag
     def self.resolve(target, dir: nil, shape: nil, env: ENV, cwd: Dir.pwd, now: Time.now)
       return Pathname.new(cwd).join(target).cleanpath if path_like?(target)
@@ -1134,18 +2453,23 @@ module ClaudeCodeMd
       base.join(filename_for(target, now))
     end
 
-    # @return [Hash] :repo may be nil when cwd is not inside a repository
+    # @return [Hash] :repo is nil when cwd is not inside a repository
     def self.directories(env: ENV, cwd: Dir.pwd)
       root = repo_root(cwd)
       { repo: root&.join(env.fetch("CCMD_REPO_SUBDIR", DEFAULT_REPO_SUBDIR)),
         global: global_directory(env) }
     end
 
+    def self.repo_root(cwd)
+      Pathname.new(cwd).expand_path.ascend { |dir| return dir if dir.join(".git").exist? }
+      nil
+    end
+
     def self.path_like?(target) = target.include?("/") || target.end_with?(".md")
 
     def self.directory_for(shape, env:, cwd:)
       dirs = directories(env: env, cwd: cwd)
-      shape ||= (env["CCMD_LOCATION"]&.to_sym || (dirs[:repo] ? :repo : :global))
+      shape ||= env["CCMD_LOCATION"]&.to_sym || (dirs[:repo] ? :repo : :global)
 
       shape == :repo && dirs[:repo] ? dirs[:repo] : dirs[:global]
     end
@@ -1155,11 +2479,6 @@ module ClaudeCodeMd
       return Pathname.new(configured) if configured
 
       Pathname.new(env.fetch("HOME")).join(DEFAULT_GLOBAL_SUBPATH)
-    end
-
-    def self.repo_root(cwd)
-      Pathname.new(cwd).expand_path.ascend { |dir| return dir if dir.join(".git").exist? }
-      nil
     end
 
     def self.filename_for(slug, now)
@@ -1187,7 +2506,140 @@ git commit -m "feat: resolve conversation paths from slugs, flags, and env"
 
 ---
 
-### Task 9: Claude process
+### Task 14: Conversation index
+
+**Files:**
+- Create: `lib/claude_code_md/conversation_index.rb`
+- Create: `spec/conversation_index_spec.rb`
+- Modify: `lib/claude_code_md.rb`
+
+**Interfaces:**
+- Consumes: `Location.directories`, `ConversationFile#frontmatter`.
+- Produces: `ConversationIndex.entries(env:, cwd:, all:) -> Array<Hash>` with keys `:path`, `:session_id`, `:updated_at`, newest first.
+
+- [ ] **Step 1: Write the failing spec**
+
+```ruby
+# spec/conversation_index_spec.rb
+# frozen_string_literal: true
+
+require "tmpdir"
+
+RSpec.describe ClaudeCodeMd::ConversationIndex do
+  around do |example|
+    Dir.mktmpdir { |dir| @dir = dir and example.run }
+  end
+
+  let(:env) { { "HOME" => @dir, "CCMD_GLOBAL_DIR" => File.join(@dir, "global") } }
+
+  def write_conversation(dir, name, session_id)
+    FileUtils.mkdir_p(dir)
+    File.write(File.join(dir, name), "---\nsession_id: #{session_id}\n---\n\n")
+  end
+
+  it "lists conversations in the resolved directory, newest first" do
+    write_conversation(File.join(@dir, "global"), "conversation.8_4_2026.older.md", "aaa")
+    sleep(0.01)
+    write_conversation(File.join(@dir, "global"), "conversation.8_5_2026.newer.md", "bbb")
+
+    entries = described_class.entries(env: env, cwd: @dir)
+
+    expect(entries.map { |entry| entry[:session_id] }).to eq(%w[bbb aaa])
+    expect(entries.first[:updated_at]).to be_a(Time)
+  end
+
+  it "ignores trace and state siblings" do
+    write_conversation(File.join(@dir, "global"), "conversation.8_5_2026.x.md", "aaa")
+    File.write(File.join(@dir, "global", "conversation.8_5_2026.x.trace.md"), "## Turn 1\n")
+    File.write(File.join(@dir, "global", "conversation.8_5_2026.x.state.json"), "{}")
+
+    expect(described_class.entries(env: env, cwd: @dir).size).to eq(1)
+  end
+
+  it "scans both locations with all" do
+    FileUtils.mkdir_p(File.join(@dir, "repo", ".git"))
+    write_conversation(File.join(@dir, "repo", "docs/agent-local/conversations"),
+                       "conversation.8_5_2026.r.md", "rrr")
+    write_conversation(File.join(@dir, "global"), "conversation.8_5_2026.g.md", "ggg")
+
+    entries = described_class.entries(env: env, cwd: File.join(@dir, "repo"), all: true)
+
+    expect(entries.map { |entry| entry[:session_id] }).to contain_exactly("rrr", "ggg")
+  end
+
+  it "returns nothing when no directory exists yet" do
+    expect(described_class.entries(env: env, cwd: @dir)).to be_empty
+  end
+end
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+Run: `bundle exec rspec spec/conversation_index_spec.rb`
+Expected: FAIL with `uninitialized constant ClaudeCodeMd::ConversationIndex`.
+
+- [ ] **Step 3: Implement**
+
+```ruby
+# lib/claude_code_md/conversation_index.rb
+# frozen_string_literal: true
+
+require_relative "conversation_file"
+require_relative "location"
+
+module ClaudeCodeMd
+  # Finds existing conversations so `ccmd ls` has something to show.
+  module ConversationIndex
+    SIBLING_SUFFIXES = [".trace.md", ".state.json"].freeze
+
+    # @param all [Boolean] true scans both the repo-relative and global directories
+    def self.entries(env: ENV, cwd: Dir.pwd, all: false)
+      directories(env: env, cwd: cwd, all: all)
+        .flat_map { |dir| conversations_in(dir) }
+        .sort_by { |entry| -entry[:updated_at].to_f }
+    end
+
+    def self.directories(env:, cwd:, all:)
+      dirs = Location.directories(env: env, cwd: cwd)
+      return dirs.values.compact.uniq if all
+
+      [dirs[:repo] || dirs[:global]]
+    end
+
+    def self.conversations_in(dir)
+      return [] unless dir&.directory?
+
+      dir.glob("*.md").reject { |path| sibling?(path) }.map do |path|
+        { path: path,
+          session_id: ConversationFile.new(path).frontmatter[:session_id],
+          updated_at: path.mtime }
+      end
+    end
+
+    def self.sibling?(path) = SIBLING_SUFFIXES.any? { |suffix| path.to_s.end_with?(suffix) }
+
+    private_class_method :directories, :conversations_in, :sibling?
+  end
+end
+```
+
+Add `require_relative "claude_code_md/conversation_index"` to `lib/claude_code_md.rb`.
+
+- [ ] **Step 4: Run to verify it passes**
+
+Run: `bundle exec rake`
+Expected: all pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lib/claude_code_md.rb lib/claude_code_md/conversation_index.rb spec/conversation_index_spec.rb
+git commit -m "feat: index existing conversations"
+```
+
+---
+
+### Task 15: Claude process
 
 **Files:**
 - Create: `lib/claude_code_md/claude_process.rb`
@@ -1196,10 +2648,10 @@ git commit -m "feat: resolve conversation paths from slugs, flags, and env"
 - Modify: `lib/claude_code_md.rb`
 
 **Interfaces:**
-- Consumes: `EventCodec`.
-- Produces: `ClaudeProcess.new(session_id:, cwd:, model:, permission_mode:, executable:)` with `#start(resume:)`, `#send_user(text)`, `#events` (a `Thread::Queue` yielding `EventCodec::Event` and the `:eof` symbol), `#alive?`, `#stop`, `#command(resume:)`.
+- Consumes: `EventCodec`, `Markers#enabled?`, `Markers#vocabulary_prompt`.
+- Produces: `ClaudeProcess.new(session_id:, cwd:, model:, permission_mode:, markers:, executable:)` with `#command(resume:)`, `#start(resume:)`, `#send_user(text)`, `#events -> Thread::Queue`, `#alive?`, `#stop`.
 
-`#interrupt` is deliberately out of scope here: the control-protocol field shapes are unverified, so Task 12 stops the child instead and resumes. See the design's Deferred section.
+`#interrupt` is deliberately absent: the control-protocol field shapes are unverified, so Ctrl+C stops the child and the next turn resumes with `--resume`.
 
 - [ ] **Step 1: Write the fake executable and the failing spec**
 
@@ -1214,7 +2666,7 @@ git commit -m "feat: resolve conversation paths from slugs, flags, and env"
 $stdout.sync = true
 
 fixture = ENV.fetch("FAKE_CLAUDE_FIXTURE")
-File.write(ENV["FAKE_CLAUDE_ARGV"], ARGV.join(" ")) if ENV["FAKE_CLAUDE_ARGV"]
+File.write(ENV["FAKE_CLAUDE_ARGV"], ARGV.join("\n")) if ENV["FAKE_CLAUDE_ARGV"]
 File.write(ENV["FAKE_CLAUDE_CWD"], Dir.pwd) if ENV["FAKE_CLAUDE_CWD"]
 
 while (line = $stdin.gets)
@@ -1236,20 +2688,19 @@ RSpec.describe ClaudeCodeMd::ClaudeProcess do
 
   let(:fake) { File.expand_path("support/fake_claude.rb", __dir__) }
   let(:fixture) { File.expand_path("fixtures/text_only.jsonl", __dir__) }
+  let(:markers) { ClaudeCodeMd::Markers.from_env({}) }
 
-  def process(cwd: @dir)
+  def process(cwd: @dir, markers: self.markers)
     described_class.new(session_id: "abc-123", cwd: cwd, model: "opus",
-                        permission_mode: "auto", executable: fake)
+                        permission_mode: "auto", markers: markers, executable: fake)
   end
 
   it "builds the verified invocation" do
     command = process.command(resume: false)
 
     expect(command).to include("-p", "--verbose", "--input-format", "stream-json",
-                               "--output-format", "stream-json",
-                               "--include-partial-messages",
-                               "--session-id", "abc-123",
-                               "--model", "opus",
+                               "--output-format", "stream-json", "--include-partial-messages",
+                               "--session-id", "abc-123", "--model", "opus",
                                "--permission-mode", "auto")
     expect(command).not_to include("--resume")
   end
@@ -1261,9 +2712,22 @@ RSpec.describe ClaudeCodeMd::ClaudeProcess do
     expect(command).not_to include("--session-id")
   end
 
+  it "teaches CC the marker vocabulary" do
+    command = process.command(resume: false)
+    fragment = command[command.index("--append-system-prompt") + 1]
+
+    expect(fragment).to include("❓").and include("Do not write options lines")
+  end
+
+  it "omits the vocabulary when inline responses are disabled" do
+    disabled = ClaudeCodeMd::Markers.from_env("CCMD_INLINE_RESPONSES" => "false")
+
+    expect(process(markers: disabled).command(resume: false)).not_to include("--append-system-prompt")
+  end
+
   it "streams decoded events for a turn and terminates with a result" do
-    subject = process
     ENV["FAKE_CLAUDE_FIXTURE"] = fixture
+    subject = process
     subject.start
     subject.send_user("hello")
 
@@ -1281,27 +2745,40 @@ RSpec.describe ClaudeCodeMd::ClaudeProcess do
     probe = File.join(@dir, "cwd.txt")
     ENV["FAKE_CLAUDE_FIXTURE"] = fixture
     ENV["FAKE_CLAUDE_CWD"] = probe
-
     subject = process(cwd: target)
     subject.start
     subject.send_user("hello")
-    subject.events.pop until subject.events.empty? && File.exist?(probe)
+    subject.events.pop until subject.events.empty?
+    subject.stop
 
     expect(File.read(probe)).to eq(target)
-    subject.stop
   ensure
     ENV.delete("FAKE_CLAUDE_FIXTURE")
     ENV.delete("FAKE_CLAUDE_CWD")
   end
 
-  it "pushes :eof when the child exits" do
+  it "sends the payload verbatim on one line" do
+    ENV["FAKE_CLAUDE_FIXTURE"] = fixture
+    ENV["FAKE_CLAUDE_STDIN"] = (probe = File.join(@dir, "stdin.txt"))
+    subject = process
+    subject.start
+    subject.send_user("[inline responses]\n\nturn 3 · ❓ one?\n  - ✅ Yes")
+    subject.events.pop until subject.events.empty?
+    subject.stop
+
+    sent = JSON.parse(File.read(probe))
+
+    expect(sent.dig("message", "content", 0, "text")).to include("turn 3 · ❓ one?")
+  ensure
+    ENV.delete("FAKE_CLAUDE_FIXTURE")
+    ENV.delete("FAKE_CLAUDE_STDIN")
+  end
+
+  it "is not alive once stopped" do
     ENV["FAKE_CLAUDE_FIXTURE"] = fixture
     subject = process
     subject.start
     subject.stop
-
-    queue = subject.events
-    queue.pop until queue.empty?
 
     expect(subject).not_to be_alive
   ensure
@@ -1342,11 +2819,12 @@ module ClaudeCodeMd
 
     attr_reader :events
 
-    def initialize(session_id:, cwd:, model:, permission_mode:, executable: "claude")
+    def initialize(session_id:, cwd:, model:, permission_mode:, markers:, executable: "claude")
       @session_id = session_id
       @cwd = cwd.to_s
       @model = model
       @permission_mode = permission_mode
+      @markers = markers
       @executable = executable
       @events = Thread::Queue.new
     end
@@ -1354,9 +2832,10 @@ module ClaudeCodeMd
     # @param resume [Boolean] true attaches to an existing session instead of declaring a new id
     def command(resume: false)
       session_flags = resume ? ["--resume", @session_id] : ["--session-id", @session_id]
+      vocabulary = @markers.enabled? ? ["--append-system-prompt", @markers.vocabulary_prompt] : []
 
       [@executable, *STREAM_FLAGS, *session_flags,
-       "--model", @model, "--permission-mode", @permission_mode]
+       "--model", @model, "--permission-mode", @permission_mode, *vocabulary]
     end
 
     def start(resume: false)
@@ -1374,7 +2853,7 @@ module ClaudeCodeMd
     def alive? = @wait&.alive? || false
 
     def stop
-      @stdin&.close unless @stdin&.closed?
+      @stdin.close if @stdin && !@stdin.closed?
       @wait&.join
       @reader&.join
       @stderr_reader&.kill
@@ -1400,31 +2879,97 @@ Add `require_relative "claude_code_md/claude_process"` to `lib/claude_code_md.rb
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `bundle exec rake`
-Expected: all pass. If a spec hangs, the reader thread is not reaching `:eof` — check that `stop` closes stdin before joining.
+Expected: all pass. If a spec hangs, the reader thread never reached `:eof` — check that `stop` closes stdin before joining.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add lib/claude_code_md.rb lib/claude_code_md/claude_process.rb spec/claude_process_spec.rb spec/support/fake_claude.rb
-git commit -m "feat: supervise the long-lived claude child process"
+git commit -m "feat: supervise the long-lived claude child and teach it the markers"
 ```
 
 ---
 
-### Task 10: Transcript renderer
+### Task 16: Transcript renderer and prose stream
+
+Options lines cannot be written by `ConversationFile`, because deciding whether a line is a prompt requires a *complete* line and prose arrives as deltas. `ProseStream` buffers to line boundaries and is the only thing that writes CC's prose.
 
 **Files:**
-- Create: `lib/claude_code_md/transcript_renderer.rb`
-- Create: `spec/transcript_renderer_spec.rb`
+- Create: `lib/claude_code_md/prose_stream.rb`, `lib/claude_code_md/transcript_renderer.rb`
+- Create: `spec/prose_stream_spec.rb`, `spec/transcript_renderer_spec.rb`
 - Modify: `lib/claude_code_md.rb`
+- Modify: `docs/designs/design.8_5_2026.inline_responses.md`
 
 **Interfaces:**
-- Consumes: `ConversationFile`, `TraceFile`, `EventCodec::Event`.
-- Produces: `TranscriptRenderer.new(conversation:, trace:, max_bytes:)` with `#begin_turn(now:)`, `#handle(event, now:) -> :continue | :finished`.
+- Consumes: `ConversationFile`, `TraceFile`, `Markers`, `EventCodec::Event`, `InlineResponses::Response`.
+- Produces:
+  - `ProseStream.new(conversation:, markers:)` with `#write(text)` and `#flush`.
+  - `TranscriptRenderer.new(conversation:, trace:, markers:, max_bytes:)` with `#begin_turn(now:, consumed:)`, `#record_sent(payload)`, `#handle(event, now:) -> :continue | :finished`.
 
-`#handle` owns the `<details>` state for thinking: open the block on the first thinking delta, close it when prose or a tool arrives, or at turn end.
+- [ ] **Step 1: Write the failing specs**
 
-- [ ] **Step 1: Write the failing spec**
+```ruby
+# spec/prose_stream_spec.rb
+# frozen_string_literal: true
+
+require "tmpdir"
+
+RSpec.describe ClaudeCodeMd::ProseStream do
+  around do |example|
+    Dir.mktmpdir { |dir| @dir = dir and example.run }
+  end
+
+  let(:markers) { ClaudeCodeMd::Markers.from_env({}) }
+  let(:conversation) { ClaudeCodeMd::ConversationFile.new(File.join(@dir, "c.md")) }
+  let(:stream) { described_class.new(conversation: conversation, markers: markers) }
+
+  before { File.write(File.join(@dir, "c.md"), "") }
+
+  it "writes prose as complete lines arrive" do
+    stream.write("Because the ")
+    stream.write("factory memoizes.\n")
+
+    expect(conversation.read).to eq("Because the factory memoizes.\n")
+  end
+
+  it "holds an incomplete line until flushed" do
+    stream.write("no newline yet")
+
+    expect(conversation.read).to eq("")
+
+    stream.flush
+
+    expect(conversation.read).to eq("no newline yet")
+  end
+
+  it "adds an options line beneath a question" do
+    stream.write("- ❓ Should ls scan both?\n")
+
+    expect(conversation.read).to eq("- ❓ Should ls scan both?\n  - Options: ✅ approve · ❌ reject · 💬 reply\n")
+  end
+
+  it "indents the options line to match a nested question" do
+    stream.write("  - ❗️ Confirm the interval.\n")
+
+    expect(conversation.read).to include("\n    - Options:")
+  end
+
+  it "leaves ordinary prose and answered markers alone" do
+    stream.write("just prose\n")
+    stream.write("- ✅ not a prompt\n")
+
+    expect(conversation.read).not_to include("Options:")
+  end
+
+  it "writes no options lines when they are switched off" do
+    quiet = described_class.new(conversation: conversation,
+                                markers: ClaudeCodeMd::Markers.from_env("CCMD_SHOW_OPTIONS" => "false"))
+    quiet.write("- ❓ Should ls scan both?\n")
+
+    expect(conversation.read).not_to include("Options:")
+  end
+end
+```
 
 ```ruby
 # spec/transcript_renderer_spec.rb
@@ -1438,36 +2983,82 @@ RSpec.describe ClaudeCodeMd::TranscriptRenderer do
   end
 
   let(:now) { Time.new(2026, 8, 5, 14, 33, 0) }
+  let(:markers) { ClaudeCodeMd::Markers.from_env({}) }
   let(:conversation) { ClaudeCodeMd::ConversationFile.new(File.join(@dir, "c.md")) }
   let(:trace) { ClaudeCodeMd::TraceFile.new(File.join(@dir, "c.trace.md")) }
-  let(:renderer) { described_class.new(conversation: conversation, trace: trace) }
+  let(:renderer) do
+    described_class.new(conversation: conversation, trace: trace, markers: markers)
+  end
 
   def event(hash) = ClaudeCodeMd::EventCodec::Event.new(type: hash["type"], subtype: hash["subtype"], raw: hash)
 
   def text_event(text)
     event("type" => "stream_event",
-          "event" => { "type" => "content_block_delta", "delta" => { "type" => "text_delta", "text" => text } })
+          "event" => { "type" => "content_block_delta",
+                       "delta" => { "type" => "text_delta", "text" => text } })
+  end
+
+  def result_event(is_error: false, subtype: "success")
+    event("type" => "result", "subtype" => subtype, "is_error" => is_error,
+          "duration_ms" => 13_068, "num_turns" => 2)
+  end
+
+  def response(kind:, prompt:, turn: 1)
+    ClaudeCodeMd::InlineResponses::Response.new(turn: turn, role: :cc, kind: kind, prompt: prompt,
+                                                text: "- ✅ y", marker_sha: "m", response_sha: "r")
   end
 
   before do
     conversation.create(session_id: "abc-123", cwd: @dir, model: "opus", permission_mode: "auto", now: now)
-    renderer.begin_turn(now: now)
   end
 
   it "opens a CC turn in the conversation and a turn in the trace" do
+    renderer.begin_turn(now: now)
+
     expect(conversation.read).to include("<!-- ccmd:turn=1 role=cc -->")
     expect(trace.read).to include("## Turn 1 — 14:33")
   end
 
-  it "streams prose into the conversation only" do
-    renderer.handle(text_event("Because the "), now: now)
-    renderer.handle(text_event("factory memoizes."), now: now)
+  it "acknowledges the inline responses it consumed" do
+    renderer.begin_turn(now: now, consumed: [response(kind: :answer, prompt: "- ❓ one?"),
+                                            response(kind: :answer, prompt: "- ❓ two?"),
+                                            response(kind: :answer, prompt: "- ❗️ three?")])
 
-    expect(conversation.read).to end_with("Because the factory memoizes.")
+    expect(conversation.read).to include("> Answering ❓×2 and ❗️×1 from turn 1.")
+  end
+
+  it "writes no acknowledgment when nothing was consumed" do
+    renderer.begin_turn(now: now, consumed: [])
+
+    expect(conversation.read).not_to include("Answering")
+  end
+
+  it "records what was sent in the trace only" do
+    renderer.begin_turn(now: now)
+    renderer.record_sent("[new message]\n\nhello")
+
+    expect(trace.read).to include("hello")
+    expect(conversation.read).not_to include("[new message]")
+  end
+
+  it "streams prose into the conversation only" do
+    renderer.begin_turn(now: now)
+    renderer.handle(text_event("Because the "), now: now)
+    renderer.handle(text_event("factory memoizes.\n"), now: now)
+
+    expect(conversation.read).to end_with("Because the factory memoizes.\n")
     expect(trace.read).not_to include("factory")
   end
 
+  it "adds options lines to questions CC streams" do
+    renderer.begin_turn(now: now)
+    renderer.handle(text_event("- ❓ Should ls scan both?\n"), now: now)
+
+    expect(conversation.read).to include("- Options: ✅ approve")
+  end
+
   it "routes tool activity to the trace only" do
+    renderer.begin_turn(now: now)
     renderer.handle(event("type" => "assistant", "message" => {
                             "content" => [{ "type" => "tool_use", "name" => "Bash",
                                             "input" => { "command" => "echo hi" } }]
@@ -1476,59 +3067,119 @@ RSpec.describe ClaudeCodeMd::TranscriptRenderer do
                             "content" => [{ "type" => "tool_result", "content" => "hi\n" }]
                           }), now: now)
 
-    expect(trace.read).to include("### `Bash`").and include("echo hi").and include("hi")
+    expect(trace.read).to include("### `Bash`").and include("echo hi")
     expect(conversation.read).not_to include("echo hi")
   end
 
-  it "closes the turn on a result, linking the trace and opening the next user turn" do
-    outcome = renderer.handle(event("type" => "result", "subtype" => "success", "is_error" => false,
-                                    "duration_ms" => 13_068, "num_turns" => 2), now: now)
+  it "closes the turn on a result, flushing prose, linking the trace, opening the next user turn" do
+    renderer.begin_turn(now: now)
+    renderer.handle(text_event("no trailing newline"), now: now)
+    outcome = renderer.handle(result_event, now: now)
 
     expect(outcome).to eq(:finished)
+    expect(conversation.read).to include("no trailing newline")
     expect(conversation.read).to include("[trace](c.trace.md#turn-1)")
     expect(conversation.read).to end_with("<!-- ccmd:turn=2 role=me -->\n## Me — 14:33\n\n")
     expect(trace.read).to include("Duration 13.1s · 2 turns")
   end
 
   it "records an errored result in the conversation so the reason is visible" do
-    renderer.handle(event("type" => "result", "subtype" => "error_during_execution",
-                          "is_error" => true, "duration_ms" => 10, "num_turns" => 1), now: now)
+    renderer.begin_turn(now: now)
+    renderer.handle(result_event(is_error: true, subtype: "error_during_execution"), now: now)
 
     expect(conversation.read).to include("> ⚠️ error_during_execution")
   end
 
   it "ignores events it has no sink for" do
+    renderer.begin_turn(now: now)
+
     expect(renderer.handle(event("type" => "rate_limit_event"), now: now)).to eq(:continue)
   end
 end
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [ ] **Step 2: Run to verify they fail**
 
-Run: `bundle exec rspec spec/transcript_renderer_spec.rb`
-Expected: FAIL with `uninitialized constant ClaudeCodeMd::TranscriptRenderer`.
+Run: `bundle exec rspec spec/prose_stream_spec.rb spec/transcript_renderer_spec.rb`
+Expected: FAIL with `uninitialized constant ClaudeCodeMd::ProseStream`.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement the prose stream**
+
+```ruby
+# lib/claude_code_md/prose_stream.rb
+# frozen_string_literal: true
+
+module ClaudeCodeMd
+  # Buffers streamed prose to line boundaries, which is what makes it possible
+  # to notice that CC just wrote a question and add an options line beneath it.
+  # Deltas arrive mid-line, so no line-level decision can be made before this.
+  class ProseStream
+    def initialize(conversation:, markers:)
+      @conversation = conversation
+      @markers = markers
+      @buffer = +""
+    end
+
+    def write(text)
+      @buffer << text
+      while (break_at = @buffer.index("\n"))
+        emit(@buffer.slice!(0..break_at))
+      end
+    end
+
+    # Writes a trailing partial line, which a turn ending without a newline leaves behind.
+    def flush
+      return if @buffer.empty?
+
+      @conversation.append(@buffer)
+      @buffer = +""
+    end
+
+    private
+
+    def emit(line)
+      @conversation.append(line)
+      return unless @markers.show_options?
+      return unless @markers.prompt_marker_for(line)
+
+      @conversation.append(@markers.options_line(indent: @markers.indent_of(line) || 0))
+    end
+  end
+end
+```
+
+- [ ] **Step 4: Implement the renderer**
 
 ```ruby
 # lib/claude_code_md/transcript_renderer.rb
 # frozen_string_literal: true
 
+require_relative "prose_stream"
+require_relative "turn_marker"
+
 module ClaudeCodeMd
-  # Routes decoded events to the two sinks: prose to the conversation, thinking
-  # and tool activity to the trace. Nothing else writes to either file.
+  # Routes decoded events to the two sinks: prose to the conversation, thinking,
+  # tool activity, and the payload that was sent to the trace.
   class TranscriptRenderer
-    def initialize(conversation:, trace:, max_bytes: nil)
+    def initialize(conversation:, trace:, markers:, max_bytes: nil)
       @conversation = conversation
       @trace = trace
+      @markers = markers
       @max_bytes = max_bytes
       @thinking_open = false
     end
 
-    def begin_turn(now: Time.now)
+    # @param consumed [Array<InlineResponses::Response>] answers this turn is carrying
+    def begin_turn(now: Time.now, consumed: [])
       @turn = TurnMarker.last_turn_number(@conversation.read)
       @conversation.open_turn(role: :cc, now: now)
+      @conversation.append_note(acknowledgment(consumed)) if consumed.any?
+      @prose = ProseStream.new(conversation: @conversation, markers: @markers)
       @trace.start_turn(turn: @turn, now: now)
+    end
+
+    def record_sent(payload)
+      @trace.record_payload(payload)
     end
 
     # @return [Symbol] :finished once the turn's result event arrives, else :continue
@@ -1542,17 +3193,12 @@ module ClaudeCodeMd
       end
 
       close_thinking
-      render_prose(event)
+      @prose.write(event.text_delta) if event.text_delta
       render_tools(event)
       :continue
     end
 
     private
-
-    def render_prose(event)
-      text = event.text_delta
-      @conversation.append(text) if text
-    end
 
     def render_tools(event)
       event.tool_uses.each { |use| @trace.tool_use(name: use["name"], input: use["input"]) }
@@ -1582,8 +3228,29 @@ module ClaudeCodeMd
       @thinking_open = false
     end
 
+    def acknowledgment(consumed)
+      counts = consumed.group_by { |response| symbol_for(response) }.transform_values(&:size)
+      turns = consumed.map(&:turn).uniq.sort
+      label = turns.size == 1 ? "turn" : "turns"
+
+      "Answering #{sentence(counts.map { |symbol, count| "#{symbol}×#{count}" })} from #{label} #{turns.join(", ")}."
+    end
+
+    def symbol_for(response)
+      return @markers.symbols[:reply] unless response.kind == :answer
+
+      @markers.prompt_marker_for(response.prompt) || @markers.symbols[:reply]
+    end
+
+    def sentence(parts)
+      return parts.join(" and ") if parts.size <= 2
+
+      "#{parts[0..-2].join(", ")} and #{parts.last}"
+    end
+
     def finish(event, now:)
       close_thinking
+      @prose.flush
       @conversation.append_note("⚠️ #{event.subtype}") if event.error?
       @conversation.append("\n[trace](#{@trace.path.basename}#{@trace.anchor(@turn)})\n")
       @trace.finish_turn(duration_ms: event.duration_ms, num_turns: event.num_turns,
@@ -1595,23 +3262,20 @@ module ClaudeCodeMd
 end
 ```
 
-Add `require_relative "claude_code_md/transcript_renderer"` to `lib/claude_code_md.rb`.
+Add `require_relative "claude_code_md/prose_stream"` and `require_relative "claude_code_md/transcript_renderer"` to `lib/claude_code_md.rb`.
 
-- [ ] **Step 4: Run to verify it passes**
+- [ ] **Step 5: Correct the design, then commit**
 
-Run: `bundle exec rake`
-Expected: all pass.
-
-- [ ] **Step 5: Commit**
+In `docs/designs/design.8_5_2026.inline_responses.md`, change the `ConversationFile` row of the Modified Components table so options-line rendering is attributed to `ProseStream`, and note that line-boundary buffering is why. Then:
 
 ```bash
-git add lib/claude_code_md.rb lib/claude_code_md/transcript_renderer.rb spec/transcript_renderer_spec.rb
-git commit -m "feat: route prose to the conversation and everything else to the trace"
+git add lib/claude_code_md.rb lib/claude_code_md/prose_stream.rb lib/claude_code_md/transcript_renderer.rb spec/prose_stream_spec.rb spec/transcript_renderer_spec.rb docs/designs/design.8_5_2026.inline_responses.md
+git commit -m "feat: stream prose with options lines and route the rest to the trace"
 ```
 
 ---
 
-### Task 11: Turn state
+### Task 17: Turn state
 
 **Files:**
 - Create: `lib/claude_code_md/turn_state.rb`
@@ -1621,9 +3285,9 @@ git commit -m "feat: route prose to the conversation and everything else to the 
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `TurnState.new` with `#idle?`, `#streaming?`, `#submit(text) -> :sent | :queued`, `#finish -> String | nil`.
+- Produces: `TurnState.new` with `#idle?`, `#streaming?`, `#submit(payload) -> :sent | :queued | nil`, `#finish -> String | nil`.
 
-The design describes `idle → streaming → tool-wait → done`. Nothing behaves differently during tool-wait — the renderer handles tool events identically whether or not prose has started — so the implementation collapses it to `idle → streaming`. Step 5 corrects the design text rather than leaving the two out of sync.
+The base design describes `idle → streaming → tool-wait → done`. Nothing behaves differently during tool-wait — the renderer handles tool events identically whether prose has started or not — so this collapses to two states. Step 5 corrects the design rather than leaving the two out of sync.
 
 - [ ] **Step 1: Write the failing spec**
 
@@ -1650,7 +3314,7 @@ RSpec.describe ClaudeCodeMd::TurnState do
     expect(state.submit("third")).to eq(:queued)
   end
 
-  it "hands back queued text in order as turns finish" do
+  it "hands back queued payloads in order as turns finish" do
     state.submit("first")
     state.submit("second")
     state.submit("third")
@@ -1662,7 +3326,7 @@ RSpec.describe ClaudeCodeMd::TurnState do
     expect(state).to be_idle
   end
 
-  it "ignores empty submissions" do
+  it "ignores an empty submission" do
     expect(state.submit("   ")).to be_nil
     expect(state).to be_idle
   end
@@ -1681,9 +3345,9 @@ Expected: FAIL with `uninitialized constant ClaudeCodeMd::TurnState`.
 # frozen_string_literal: true
 
 module ClaudeCodeMd
-  # Tracks whether a turn is in flight and holds anything the user sends while
-  # one is. Collapsed to idle and streaming: no behavior differs during a tool
-  # call, so a separate state would carry no information.
+  # Tracks whether a turn is in flight and holds anything sent while one is.
+  # Two states only: no behavior differs during a tool call, so a separate
+  # tool-wait state would carry no information.
   class TurnState
     def initialize
       @streaming = false
@@ -1695,11 +3359,11 @@ module ClaudeCodeMd
 
     # @return [Symbol, nil] :sent when the caller should transmit now, :queued
     #   when it is held for later, nil when there was nothing to send
-    def submit(text)
-      return nil if text.nil? || text.strip.empty?
+    def submit(payload)
+      return nil if payload.nil? || payload.strip.empty?
 
       if @streaming
-        @queued << text
+        @queued << payload
         :queued
       else
         @streaming = true
@@ -1707,11 +3371,11 @@ module ClaudeCodeMd
       end
     end
 
-    # @return [String, nil] the next queued turn to transmit, or nil when idle
+    # @return [String, nil] the next queued payload, or nil when going idle
     def finish
-      next_text = @queued.shift
-      @streaming = !next_text.nil?
-      next_text
+      next_payload = @queued.shift
+      @streaming = !next_payload.nil?
+      next_payload
     end
   end
 end
@@ -1726,7 +3390,7 @@ Expected: all pass.
 
 - [ ] **Step 5: Correct the design, then commit**
 
-In `docs/designs/design.8_5_2026.ccmd_architecture.md`, change the `TurnState` row of the Components table from `idle → streaming → tool-wait → done; queue turns arriving mid-flight` to `idle → streaming; queue turns arriving mid-flight`, and change the Concurrency section's mention of the same four states to two. Then:
+In `docs/designs/design.8_5_2026.ccmd_architecture.md`, change the `TurnState` row of the Components table to `idle → streaming; queue turns arriving mid-flight`, and change the Concurrency section's mention of four states to two.
 
 ```bash
 git add lib/claude_code_md.rb lib/claude_code_md/turn_state.rb spec/turn_state_spec.rb docs/designs/design.8_5_2026.ccmd_architecture.md
@@ -1735,18 +3399,24 @@ git commit -m "feat: track in-flight turns and queue mid-turn submissions"
 
 ---
 
-### Task 12: Session orchestrator
+### Task 18: Session orchestrator
 
 **Files:**
 - Create: `lib/claude_code_md/session.rb`
 - Create: `spec/session_spec.rb`
 - Modify: `lib/claude_code_md.rb`
+- Modify: `docs/designs/design.8_5_2026.inline_responses.md`
 
 **Interfaces:**
-- Consumes: every component from Tasks 5–11.
-- Produces: `Session.new(conversation:, trace:, gate:, process:, renderer:, state:, poll_interval:)` with `#run(iterations: nil)` and `#tick -> :idle | :sent | :finished | :dead`.
+- Consumes: every component from Tasks 6–17.
+- Produces: `Session.new(conversation:, trace:, gate:, process:, renderer:, turn_state:, conversation_state:, markers:, poll_interval:, reporter:)` with `#run(iterations: nil)` and `#tick -> :idle | :sent | :finished | :dead`.
 
-`#run(iterations:)` exists so specs can drive a bounded number of loop passes instead of racing a background thread.
+`#run(iterations:)` exists so specs can drive a bounded number of loop passes instead of racing a background thread. `reporter` receives deletion notices; it defaults to `$stderr` and keeps housekeeping out of the document.
+
+Two ordering rules the specs pin down:
+
+1. The CC turn is opened **before** returning to the poll loop, so a token send stops matching.
+2. Snapshots advance **after** the turn finishes, so anything typed while it streamed is picked up next time.
 
 - [ ] **Step 1: Write the failing spec**
 
@@ -1763,22 +3433,36 @@ RSpec.describe ClaudeCodeMd::Session do
 
   let(:now) { Time.new(2026, 8, 5, 14, 32, 0) }
   let(:path) { File.join(@dir, "c.md") }
+  let(:markers) { ClaudeCodeMd::Markers.from_env({}) }
   let(:conversation) { ClaudeCodeMd::ConversationFile.new(path) }
   let(:trace) { ClaudeCodeMd::TraceFile.new(conversation.trace_path) }
   let(:gate) { ClaudeCodeMd::SendGate.new(path) }
+  let(:reporter) { StringIO.new }
+
   let(:process) do
     ClaudeCodeMd::ClaudeProcess.new(session_id: "abc-123", cwd: @dir, model: "opus",
-                                    permission_mode: "auto",
+                                    permission_mode: "auto", markers: markers,
                                     executable: File.expand_path("support/fake_claude.rb", __dir__))
   end
+
+  let(:conversation_state) do
+    ClaudeCodeMd::ConversationState.load(path: conversation.state_path,
+                                         blocks: conversation.blocks, markers: markers)
+  end
+
   let(:session) do
-    described_class.new(conversation: conversation, trace: trace, gate: gate, process: process,
-                        renderer: ClaudeCodeMd::TranscriptRenderer.new(conversation: conversation, trace: trace),
-                        state: ClaudeCodeMd::TurnState.new, poll_interval: 0)
+    described_class.new(
+      conversation: conversation, trace: trace, gate: gate, process: process,
+      renderer: ClaudeCodeMd::TranscriptRenderer.new(conversation: conversation, trace: trace,
+                                                     markers: markers),
+      turn_state: ClaudeCodeMd::TurnState.new, conversation_state: conversation_state,
+      markers: markers, poll_interval: 0, reporter: reporter
+    )
   end
 
   before do
     ENV["FAKE_CLAUDE_FIXTURE"] = File.expand_path("fixtures/text_only.jsonl", __dir__)
+    ENV["FAKE_CLAUDE_STDIN"] = File.join(@dir, "stdin.txt")
     conversation.create(session_id: "abc-123", cwd: @dir, model: "opus", permission_mode: "auto", now: now)
     process.start
   end
@@ -1786,7 +3470,10 @@ RSpec.describe ClaudeCodeMd::Session do
   after do
     process.stop
     ENV.delete("FAKE_CLAUDE_FIXTURE")
+    ENV.delete("FAKE_CLAUDE_STDIN")
   end
+
+  def sent_payload = JSON.parse(File.read(ENV.fetch("FAKE_CLAUDE_STDIN"))).dig("message", "content", 0, "text")
 
   it "does nothing while the user is only typing and saving" do
     conversation.append("half a thought\n")
@@ -1807,11 +3494,55 @@ RSpec.describe ClaudeCodeMd::Session do
     expect(conversation.read).to end_with("<!-- ccmd:turn=2 role=me -->\n## Me — #{now.strftime("%H:%M")}\n\n")
   end
 
-  it "does not re-fire on a token send once the CC turn is open" do
+  it "opens the CC turn before polling again, so a token send fires once" do
     conversation.append("a question\n\n/send\n")
 
     expect(session.tick).to eq(:sent)
     expect(session.tick).not_to eq(:sent)
+  end
+
+  it "sends an inline answer with no trailing text at all" do
+    conversation.append("- ❓ Should ls scan both?\n")
+    conversation_state.advance(conversation.blocks).save
+    conversation.append("  - ✅ Yes\n")
+    FileUtils.touch(gate.sidecar_path)
+
+    expect(session.tick).to eq(:sent)
+    expect(sent_payload).to include("[inline responses]").and include("- ✅ Yes")
+    expect(sent_payload).not_to include("[new message]")
+  end
+
+  it "acknowledges consumed answers in the CC block" do
+    conversation.append("- ❓ Should ls scan both?\n")
+    conversation_state.advance(conversation.blocks).save
+    conversation.append("  - ✅ Yes\n")
+    FileUtils.touch(gate.sidecar_path)
+    session.tick
+
+    expect(conversation.read).to include("> Answering ❓×1 from turn 1.")
+  end
+
+  it "does not re-send an answer after the turn completes" do
+    conversation.append("- ❓ Should ls scan both?\n")
+    conversation_state.advance(conversation.blocks).save
+    conversation.append("  - ✅ Yes\n")
+    FileUtils.touch(gate.sidecar_path)
+    session.tick
+    session.run(iterations: 200)
+
+    FileUtils.touch(gate.sidecar_path)
+
+    expect(session.tick).not_to eq(:sent)
+  end
+
+  it "reports deletions to the reporter rather than to the document" do
+    conversation.append("a line CC wrote\n")
+    conversation_state.advance(conversation.blocks).save
+    File.write(path, conversation.read.sub("a line CC wrote\n", ""))
+    FileUtils.touch(gate.sidecar_path)
+    session.tick
+
+    expect(reporter.string).to include("a line CC wrote")
   end
 
   it "reports a dead child" do
@@ -1833,22 +3564,31 @@ Expected: FAIL with `uninitialized constant ClaudeCodeMd::Session`.
 # lib/claude_code_md/session.rb
 # frozen_string_literal: true
 
+require_relative "inline_responses"
+require_relative "turn_composer"
+
 module ClaudeCodeMd
   # The watch loop. Interleaves polling for a send signal with draining the
   # events the reader thread has queued, and does every file write itself so
   # nothing else races on the conversation.
   class Session
     DEFAULT_POLL_INTERVAL = 0.15
+    EMPTY_RESULT = InlineResponses::Result.new(responses: [], deletions: []).freeze
 
-    def initialize(conversation:, trace:, gate:, process:, renderer:, state:,
-                   poll_interval: DEFAULT_POLL_INTERVAL)
+    def initialize(conversation:, trace:, gate:, process:, renderer:, turn_state:,
+                   conversation_state:, markers:, poll_interval: DEFAULT_POLL_INTERVAL,
+                   reporter: $stderr)
       @conversation = conversation
       @trace = trace
       @gate = gate
       @process = process
       @renderer = renderer
-      @state = state
+      @turn_state = turn_state
+      @conversation_state = conversation_state
+      @markers = markers
       @poll_interval = poll_interval
+      @reporter = reporter
+      @response_sets = {}
     end
 
     # @param iterations [Integer, nil] nil loops until the child dies
@@ -1867,7 +3607,6 @@ module ClaudeCodeMd
     # One pass: deliver a pending send, then drain whatever has arrived.
     def tick
       return :dead unless @process.alive? || !@process.events.empty?
-
       return :sent if deliver_pending_turn == :sent
 
       drain_events
@@ -1878,13 +3617,37 @@ module ClaudeCodeMd
     def deliver_pending_turn
       return nil unless @gate.poll
 
-      text = @conversation.pending_text
-      return nil if @state.submit(text) != :sent
+      found = detect_inline_responses
+      report(found.deletions)
+      payload = TurnComposer.call(responses: found.responses, trailing_text: @conversation.pending_text)
+      return nil if payload.empty?
+      return nil if @turn_state.submit(payload) != :sent
 
-      # Open the CC turn before returning, so a token send stops matching.
-      @renderer.begin_turn
-      @process.send_user(text)
+      @response_sets[payload] = found.responses
+      consume(found.responses)
+      transmit(payload)
       :sent
+    end
+
+    def detect_inline_responses
+      return EMPTY_RESULT unless @markers.enabled?
+
+      InlineResponses.call(blocks: @conversation.blocks, state: @conversation_state, markers: @markers)
+    end
+
+    # Recorded at send time so re-saving before the turn ends cannot double-send.
+    def consume(responses)
+      return if responses.empty?
+
+      @conversation_state.mark_consumed(responses).save
+    end
+
+    def transmit(payload)
+      # The CC turn must be open before the loop polls again, or a token send
+      # would still be the last non-empty line and fire a second time.
+      @renderer.begin_turn(consumed: @response_sets.fetch(payload, []))
+      @renderer.record_sent(payload)
+      @process.send_user(payload)
     end
 
     def drain_events
@@ -1893,18 +3656,28 @@ module ClaudeCodeMd
         event = @process.events.pop
         return :dead if event == :eof
 
-        outcome = :finished if @renderer.handle(event) == :finished
-        send_queued_turn if outcome == :finished
+        next unless @renderer.handle(event) == :finished
+
+        outcome = :finished
+        complete_turn
       end
       outcome
     end
 
-    def send_queued_turn
-      queued = @state.finish
+    # Snapshots advance only here, so anything typed while the turn streamed is
+    # picked up on the next send rather than this one.
+    def complete_turn
+      @conversation_state.advance(@conversation.blocks).save
+      queued = @turn_state.finish
       return unless queued
 
-      @renderer.begin_turn
-      @process.send_user(queued)
+      transmit(queued)
+    end
+
+    def report(deletions)
+      deletions.each do |deletion|
+        @reporter.puts("deleted from turn #{deletion[:turn]} #{deletion[:role]}: #{deletion[:text].strip}")
+      end
     end
   end
 end
@@ -1917,27 +3690,89 @@ Add `require_relative "claude_code_md/session"` to `lib/claude_code_md.rb`.
 Run: `bundle exec rake`
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Correct the design, then commit**
+
+In `docs/designs/design.8_5_2026.inline_responses.md`, change the `ConversationFile` row so state updates are attributed to `Session`, which already owns turn boundaries.
 
 ```bash
-git add lib/claude_code_md.rb lib/claude_code_md/session.rb spec/session_spec.rb
-git commit -m "feat: watch loop wiring the gate, child, and renderer together"
+git add lib/claude_code_md.rb lib/claude_code_md/session.rb spec/session_spec.rb docs/designs/design.8_5_2026.inline_responses.md
+git commit -m "feat: watch loop composing inline responses into turns"
 ```
 
 ---
 
-### Task 13: The `open` command
+### Task 19: The `open` command
 
 **Files:**
-- Modify: `lib/claude_code_md/cli.rb`
-- Create: `spec/cli_spec.rb`
-- Modify: `README.md`
+- Create: `lib/claude_code_md/runner.rb`
+- Create: `spec/runner_spec.rb`, `spec/cli_spec.rb`
+- Modify: `lib/claude_code_md/cli.rb`, `lib/claude_code_md.rb`, `README.md`
 
 **Interfaces:**
-- Consumes: `Location`, `ConversationFile`, `TraceFile`, `SendGate`, `ClaudeProcess`, `TranscriptRenderer`, `TurnState`, `Session`.
-- Produces: `ccmd open [TARGET]`, invoked implicitly so `ccmd notes/chat.md` and `ccmd flaky-spec` both work. Flags: `--cwd`, `--model`, `--permission-mode`, `--effort`, `--new`, `--dir`, `--repo`, `--global`, `--trace-max-bytes`.
+- Consumes: everything above.
+- Produces: `Runner.new(target:, options:, env:) -> Runner` with `#path`, `#session_id`, `#cwd`, `#resume?`, `#call`; `ccmd open [TARGET]` invoked implicitly so `ccmd notes/chat.md` and `ccmd flaky-spec` both work; `Cli.implicit_open?(args) -> Boolean`.
 
-- [ ] **Step 1: Write the failing spec**
+`--new` against an existing file is an error rather than a silent new session: frontmatter is written once and never rewritten, so a fresh session id could not be recorded without breaking the append-only invariant.
+
+- [ ] **Step 1: Write the failing specs**
+
+```ruby
+# spec/runner_spec.rb
+# frozen_string_literal: true
+
+require "tmpdir"
+
+RSpec.describe ClaudeCodeMd::Runner do
+  around do |example|
+    Dir.mktmpdir { |dir| @dir = dir and example.run }
+  end
+
+  let(:env) { { "HOME" => @dir, "CCMD_GLOBAL_DIR" => File.join(@dir, "global") } }
+
+  def runner(target, options = {})
+    described_class.new(target: target,
+                        options: { model: "opus", permission_mode: "auto" }.merge(options),
+                        env: env)
+  end
+
+  it "resolves a slug into the global directory" do
+    expect(runner("flaky-spec").path.to_s).to start_with(File.join(@dir, "global"))
+  end
+
+  it "generates a session id for a new conversation" do
+    expect(runner("flaky-spec").session_id).to match(/\A[0-9a-f-]{36}\z/)
+    expect(runner("flaky-spec")).not_to be_resume
+  end
+
+  it "reuses the session id recorded in an existing conversation" do
+    path = File.join(@dir, "existing.md")
+    File.write(path, "---\nsession_id: kept-123\ncwd: #{@dir}\nmodel: sonnet\n---\n\n")
+    subject = runner(path)
+
+    expect(subject.session_id).to eq("kept-123")
+    expect(subject.cwd).to eq(@dir)
+    expect(subject).to be_resume
+  end
+
+  it "prefers the repo root over the working directory for a new conversation" do
+    FileUtils.mkdir_p(File.join(@dir, "repo", ".git"))
+    FileUtils.mkdir_p(nested = File.join(@dir, "repo", "app"))
+
+    expect(runner("x", cwd_override: nested).cwd).to eq(File.join(@dir, "repo"))
+  end
+
+  it "honours an explicit cwd" do
+    expect(runner("x", cwd: "/tmp/elsewhere").cwd).to eq("/tmp/elsewhere")
+  end
+
+  it "refuses --new against an existing conversation" do
+    path = File.join(@dir, "existing.md")
+    File.write(path, "---\nsession_id: kept-123\n---\n\n")
+
+    expect { runner(path, new: true).session_id }.to raise_error(Thor::Error, /already exists/)
+  end
+end
+```
 
 ```ruby
 # spec/cli_spec.rb
@@ -1953,7 +3788,7 @@ RSpec.describe ClaudeCodeMd::Cli do
       expect(described_class.implicit_open?(["flaky-spec"])).to be(true)
     end
 
-    it "leaves a real command alone" do
+    it "leaves real commands alone" do
       expect(described_class.implicit_open?(["ls"])).to be(false)
       expect(described_class.implicit_open?(["setup"])).to be(false)
       expect(described_class.implicit_open?(["help"])).to be(false)
@@ -1976,12 +3811,129 @@ RSpec.describe ClaudeCodeMd::Cli do
 end
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [ ] **Step 2: Run to verify they fail**
 
-Run: `bundle exec rspec spec/cli_spec.rb`
-Expected: FAIL with `undefined method 'implicit_open?'`.
+Run: `bundle exec rspec spec/runner_spec.rb spec/cli_spec.rb`
+Expected: FAIL with `uninitialized constant ClaudeCodeMd::Runner`.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement the runner**
+
+```ruby
+# lib/claude_code_md/runner.rb
+# frozen_string_literal: true
+
+require "securerandom"
+
+module ClaudeCodeMd
+  # Assembles the object graph for `ccmd open`, so the CLI stays a thin
+  # argument-parsing layer. Frontmatter wins over flags for a conversation that
+  # already exists, which is what stops a reattach from silently changing its
+  # model or working directory.
+  class Runner
+    def initialize(target:, options:, env: ENV)
+      @target = target
+      @options = options
+      @env = env
+    end
+
+    def markers = @markers ||= Markers.from_env(@env)
+
+    def path
+      @path ||= Location.resolve(@target, dir: @options[:dir], shape: shape, env: @env)
+    end
+
+    def conversation = @conversation ||= ConversationFile.new(path)
+
+    def resume?
+      return @resume unless @resume.nil?
+
+      @resume = conversation.exist? && !@options[:new]
+    end
+
+    def session_id
+      @session_id ||= begin
+        refuse_new_over_existing!
+        resume? ? settings.fetch(:session_id) { SecureRandom.uuid } : SecureRandom.uuid
+      end
+    end
+
+    def cwd
+      @cwd ||= if resume?
+                 settings.fetch(:cwd) { default_cwd }
+               else
+                 @options[:cwd] || default_cwd
+               end
+    end
+
+    def call
+      conversation.create(session_id: session_id, cwd: cwd, model: model,
+                          permission_mode: permission_mode)
+      process = build_process
+      process.start(resume: resume?)
+      install_interrupt_handler(process)
+      build_session(process).run
+    ensure
+      process&.stop
+    end
+
+    private
+
+    def settings = @settings ||= conversation.exist? ? conversation.frontmatter : {}
+    def model = resume? ? settings.fetch(:model) { @options[:model] } : @options[:model]
+
+    def permission_mode
+      resume? ? settings.fetch(:permission_mode) { @options[:permission_mode] } : @options[:permission_mode]
+    end
+
+    def default_cwd
+      base = @options[:cwd_override] || Dir.pwd
+      Location.repo_root(base)&.to_s || base
+    end
+
+    def shape
+      return :repo if @options[:repo]
+      return :global if @options[:global]
+
+      nil
+    end
+
+    def refuse_new_over_existing!
+      return unless @options[:new] && conversation.exist?
+
+      raise Thor::Error, "#{path} already exists; frontmatter is written once, so pass a new name instead"
+    end
+
+    def build_process
+      ClaudeProcess.new(session_id: session_id, cwd: cwd, model: model,
+                        permission_mode: permission_mode, markers: markers)
+    end
+
+    def build_session(process)
+      trace = TraceFile.new(conversation.trace_path)
+      Session.new(
+        conversation: conversation, trace: trace, gate: SendGate.new(conversation.path),
+        process: process,
+        renderer: TranscriptRenderer.new(conversation: conversation, trace: trace,
+                                         markers: markers, max_bytes: @options[:trace_max_bytes]),
+        turn_state: TurnState.new,
+        conversation_state: ConversationState.load(path: conversation.state_path,
+                                                   blocks: conversation.blocks, markers: markers),
+        markers: markers
+      )
+    end
+
+    def install_interrupt_handler(process)
+      Signal.trap("INT") do
+        conversation.append_note("⏹ interrupted")
+        process.stop
+        exit(130)
+      end
+    end
+  end
+end
+```
+
+- [ ] **Step 4: Wire the command**
 
 Replace the body of `ClaudeCodeMd::Cli` with:
 
@@ -2000,7 +3952,7 @@ Replace the body of `ClaudeCodeMd::Cli` with:
     option :model, type: :string, default: "opus", desc: "Model alias or full name"
     option :permission_mode, type: :string, default: "auto", desc: "CC permission mode"
     option :effort, type: :string, desc: "Reasoning effort"
-    option :new, type: :boolean, default: false, desc: "Start a new session even if the file exists"
+    option :new, type: :boolean, default: false, desc: "Require a brand-new conversation file"
     option :dir, type: :string, desc: "Directory to resolve a slug in"
     option :repo, type: :boolean, desc: "Resolve the slug repo-relative"
     option :global, type: :boolean, desc: "Resolve the slug in the global directory"
@@ -2028,267 +3980,37 @@ Replace the body of `ClaudeCodeMd::Cli` with:
     def self.exit_on_failure? = true
 ```
 
-Create the runner that turns options into wired objects, in the same file below the class:
+Add `require_relative "claude_code_md/runner"` to `lib/claude_code_md.rb`, after the components it references.
 
-```ruby
-  # Assembles the object graph for `ccmd open`. Kept out of Cli so the command
-  # stays a thin argument-parsing layer.
-  class Runner
-    def initialize(target:, options:)
-      @target = target
-      @options = options
-    end
-
-    def call
-      conversation = ConversationFile.new(path)
-      conversation.create(session_id: session_id, cwd: cwd, model: @options[:model],
-                          permission_mode: @options[:permission_mode])
-      trace = TraceFile.new(conversation.trace_path)
-      process = build_process(conversation)
-      process.start(resume: !@options[:new] && resume?(conversation))
-      install_interrupt_handler(process, conversation)
-      build_session(conversation, trace, process).run
-    ensure
-      process&.stop
-    end
-
-    private
-
-    def path
-      @path ||= Location.resolve(@target, dir: @options[:dir], shape: shape)
-    end
-
-    def shape
-      return :repo if @options[:repo]
-      return :global if @options[:global]
-
-      nil
-    end
-
-    def cwd
-      @options[:cwd] || Location.repo_root(Dir.pwd)&.to_s || Dir.pwd
-    end
-
-    def session_id
-      @session_id ||= existing_session_id || SecureRandom.uuid
-    end
-
-    def existing_session_id
-      return nil if @options[:new]
-
-      ConversationFile.new(path).then { |file| file.exist? ? file.frontmatter[:session_id] : nil }
-    end
-
-    def resume?(conversation) = !conversation.frontmatter[:session_id].nil? && !@resumed_fresh
-
-    def build_process(conversation)
-      settings = conversation.frontmatter
-      @resumed_fresh = false
-      ClaudeProcess.new(session_id: settings.fetch(:session_id, session_id),
-                        cwd: settings.fetch(:cwd, cwd),
-                        model: settings.fetch(:model, @options[:model]),
-                        permission_mode: settings.fetch(:permission_mode, @options[:permission_mode]))
-    end
-
-    def build_session(conversation, trace, process)
-      Session.new(conversation: conversation, trace: trace,
-                  gate: SendGate.new(conversation.path),
-                  process: process,
-                  renderer: TranscriptRenderer.new(conversation: conversation, trace: trace,
-                                                   max_bytes: @options[:trace_max_bytes]),
-                  state: TurnState.new)
-    end
-
-    def install_interrupt_handler(process, conversation)
-      Signal.trap("INT") do
-        conversation.append_note("⏹ interrupted")
-        process.stop
-        exit(130)
-      end
-    end
-  end
-```
-
-Add `require "securerandom"` and `require_relative "location"` to the top of `cli.rb`, plus `require_relative "runner"` style requires as needed by however the file is split. **A newly created file has just been given a session id in its frontmatter, so `resume?` must be false on that first start** — the file did not exist before `create`, so capture `conversation.exist?` before calling `create` and pass that boolean into `start(resume:)`.
-
-- [ ] **Step 4: Run to verify it passes**
+- [ ] **Step 5: Run to verify they pass**
 
 Run: `bundle exec rake`
 Expected: all pass.
 
-- [ ] **Step 5: Update the README and commit**
+- [ ] **Step 6: Update the README and commit**
 
-Replace the README's status blockquote with real usage: `ccmd notes/chat.md`, `ccmd flaky-spec`, the flag list, and the two location environment variables. Keep the note that in-file approvals are not implemented.
+Replace the README's status blockquote with real usage: `ccmd notes/chat.md`, `ccmd flaky-spec`, the flag list, the two location environment variables, the inline-response markers with a short example, and the `CCMD_*` configuration table. Keep the note that in-file permission approvals are not implemented.
 
 ```bash
-git add lib/claude_code_md/cli.rb spec/cli_spec.rb README.md
+git add lib/claude_code_md.rb lib/claude_code_md/cli.rb lib/claude_code_md/runner.rb spec/runner_spec.rb spec/cli_spec.rb README.md
 git commit -m "feat: ccmd open runs a conversation end to end"
 ```
 
 ---
 
-### Task 14: The `ls` and `trace` commands
+### Task 20: The `ls`, `trace`, and `setup` commands
 
 **Files:**
-- Modify: `lib/claude_code_md/cli.rb`
-- Create: `lib/claude_code_md/conversation_index.rb`
-- Create: `spec/conversation_index_spec.rb`
-
-**Interfaces:**
-- Consumes: `Location.directories`, `ConversationFile`.
-- Produces: `ConversationIndex.entries(env:, cwd:, all:) -> Array<Hash>` with keys `:path`, `:session_id`, `:updated_at`; `ccmd ls [--all]`; `ccmd trace TARGET`.
-
-- [ ] **Step 1: Write the failing spec**
-
-```ruby
-# spec/conversation_index_spec.rb
-# frozen_string_literal: true
-
-require "tmpdir"
-
-RSpec.describe ClaudeCodeMd::ConversationIndex do
-  around do |example|
-    Dir.mktmpdir { |dir| @dir = dir and example.run }
-  end
-
-  let(:env) { { "HOME" => @dir, "CCMD_GLOBAL_DIR" => File.join(@dir, "global") } }
-
-  def write_conversation(dir, name, session_id)
-    FileUtils.mkdir_p(dir)
-    File.write(File.join(dir, name), "---\nsession_id: #{session_id}\n---\n\n")
-  end
-
-  it "lists conversations in the resolved directory, newest first" do
-    write_conversation(File.join(@dir, "global"), "conversation.8_4_2026.older.md", "aaa")
-    sleep(0.01)
-    write_conversation(File.join(@dir, "global"), "conversation.8_5_2026.newer.md", "bbb")
-
-    entries = described_class.entries(env: env, cwd: @dir)
-
-    expect(entries.map { |entry| entry[:session_id] }).to eq(%w[bbb aaa])
-    expect(entries.first[:updated_at]).to be_a(Time)
-  end
-
-  it "ignores trace files" do
-    write_conversation(File.join(@dir, "global"), "conversation.8_5_2026.x.md", "aaa")
-    File.write(File.join(@dir, "global", "conversation.8_5_2026.x.trace.md"), "## Turn 1\n")
-
-    expect(described_class.entries(env: env, cwd: @dir).size).to eq(1)
-  end
-
-  it "scans both locations with all" do
-    FileUtils.mkdir_p(File.join(@dir, "repo", ".git"))
-    write_conversation(File.join(@dir, "repo", "docs/agent-local/conversations"), "conversation.8_5_2026.r.md", "rrr")
-    write_conversation(File.join(@dir, "global"), "conversation.8_5_2026.g.md", "ggg")
-
-    entries = described_class.entries(env: env, cwd: File.join(@dir, "repo"), all: true)
-
-    expect(entries.map { |entry| entry[:session_id] }).to contain_exactly("rrr", "ggg")
-  end
-
-  it "returns nothing when no directory exists yet" do
-    expect(described_class.entries(env: env, cwd: @dir)).to be_empty
-  end
-end
-```
-
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `bundle exec rspec spec/conversation_index_spec.rb`
-Expected: FAIL with `uninitialized constant ClaudeCodeMd::ConversationIndex`.
-
-- [ ] **Step 3: Implement**
-
-```ruby
-# lib/claude_code_md/conversation_index.rb
-# frozen_string_literal: true
-
-require_relative "conversation_file"
-require_relative "location"
-
-module ClaudeCodeMd
-  # Finds existing conversations so `ccmd ls` has something to show.
-  module ConversationIndex
-    # @param all [Boolean] true scans both the repo-relative and global directories
-    def self.entries(env: ENV, cwd: Dir.pwd, all: false)
-      directories(env: env, cwd: cwd, all: all)
-        .flat_map { |dir| conversations_in(dir) }
-        .sort_by { |entry| -entry[:updated_at].to_f }
-    end
-
-    def self.directories(env:, cwd:, all:)
-      dirs = Location.directories(env: env, cwd: cwd)
-      return dirs.values.compact if all
-
-      [dirs[:repo] || dirs[:global]]
-    end
-
-    def self.conversations_in(dir)
-      return [] unless dir&.directory?
-
-      dir.glob("*.md").reject { |path| path.to_s.end_with?(".trace.md") }.map do |path|
-        { path: path,
-          session_id: ConversationFile.new(path).frontmatter[:session_id],
-          updated_at: path.mtime }
-      end
-    end
-
-    private_class_method :directories, :conversations_in
-  end
-end
-```
-
-Add these commands to `Cli`:
-
-```ruby
-    desc "ls", "List conversations with their session id and last activity"
-    option :all, type: :boolean, default: false, desc: "Scan both the repo and global directories"
-    def ls
-      entries = ConversationIndex.entries(all: options[:all])
-      return say("no conversations yet") if entries.empty?
-
-      entries.each do |entry|
-        say format("%-52s %s  %s", entry[:path].basename, entry[:updated_at].strftime("%-m/%-d/%Y %H:%M"),
-                   entry[:session_id])
-      end
-    end
-
-    desc "trace TARGET", "Print the path of a conversation's trace file"
-    def trace(target)
-      say ConversationFile.new(Location.resolve(target)).trace_path.to_s
-    end
-```
-
-Add `require_relative "claude_code_md/conversation_index"` to `lib/claude_code_md.rb`.
-
-- [ ] **Step 4: Run to verify it passes**
-
-Run: `bundle exec rake`
-Expected: all pass.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add lib/claude_code_md.rb lib/claude_code_md/cli.rb lib/claude_code_md/conversation_index.rb spec/conversation_index_spec.rb
-git commit -m "feat: list conversations and locate their traces"
-```
-
----
-
-### Task 15: The `setup` command
-
-**Files:**
-- Modify: `lib/claude_code_md/cli.rb`
 - Create: `lib/claude_code_md/editor_setup.rb`
 - Create: `spec/editor_setup_spec.rb`
+- Modify: `lib/claude_code_md/cli.rb`, `lib/claude_code_md.rb`, `README.md`
 - Modify: `docs/designs/design.8_5_2026.ccmd_architecture.md`
-- Modify: `README.md`
 
 **Interfaces:**
-- Consumes: nothing.
-- Produces: `EditorSetup.new(keybindings_path:, tasks_path:)` with `#keybinding_snippet`, `#task_snippet`, `#write_task -> :created | :present`, `#write_keybinding -> :created | :present | :refused`; `ccmd setup [--write]`.
+- Consumes: `ConversationIndex`, `Location`, `ConversationFile`.
+- Produces: `EditorSetup.new(keybindings_path:, tasks_path:)` with `#keybinding_snippet`, `#task_snippet`, `#write_task -> :created | :present | :refused`, `#write_keybinding -> :created | :present | :refused`; commands `ccmd ls [--all]`, `ccmd trace TARGET`, `ccmd setup [--write]`.
 
-Writing is opt-in and conservative: VSCode config files are JSONC, and comments cannot be round-tripped by a JSON parser. `--write` therefore creates `tasks.json` when absent and refuses rather than mangling any file containing comments. Printing is the default.
+Writing is opt-in and conservative. VSCode config is JSONC, and comments cannot survive a JSON round trip, so `--write` refuses any file containing them rather than eating them.
 
 - [ ] **Step 1: Write the failing spec**
 
@@ -2307,7 +4029,7 @@ RSpec.describe ClaudeCodeMd::EditorSetup do
   let(:tasks) { File.join(@dir, ".vscode", "tasks.json") }
   let(:setup) { described_class.new(keybindings_path: keybindings, tasks_path: tasks) }
 
-  it "offers snippets that name the cc-send task and cmd+enter" do
+  it "offers snippets naming the cc-send task and cmd+enter" do
     expect(setup.task_snippet).to include("cc-send").and include("${file}.send")
     expect(setup.keybinding_snippet).to include("cmd+enter").and include("runCommands")
   end
@@ -2434,9 +4156,28 @@ module ClaudeCodeMd
 end
 ```
 
-Add to `Cli`:
+- [ ] **Step 4: Wire the commands**
+
+Add to `ClaudeCodeMd::Cli`:
 
 ```ruby
+    desc "ls", "List conversations with their session id and last activity"
+    option :all, type: :boolean, default: false, desc: "Scan both the repo and global directories"
+    def ls
+      entries = ConversationIndex.entries(all: options[:all])
+      return say("no conversations yet") if entries.empty?
+
+      entries.each do |entry|
+        say format("%-52s %s  %s", entry[:path].basename,
+                   entry[:updated_at].strftime("%-m/%-d/%Y %H:%M"), entry[:session_id])
+      end
+    end
+
+    desc "trace TARGET", "Print the path of a conversation's trace file"
+    def trace(target)
+      say ConversationFile.new(Location.resolve(target)).trace_path.to_s
+    end
+
     desc "setup", "Show, or with --write install, the cmd+enter editor wiring"
     option :write, type: :boolean, default: false, desc: "Write the files instead of printing"
     option :keybindings, type: :string, desc: "Path to keybindings.json"
@@ -2450,7 +4191,7 @@ Add to `Cli`:
     end
 ```
 
-with these private helpers on `Cli`:
+and these private helpers:
 
 ```ruby
     private
@@ -2470,37 +4211,48 @@ with these private helpers on `Cli`:
 
 Add `require_relative "claude_code_md/editor_setup"` to `lib/claude_code_md.rb`.
 
-- [ ] **Step 4: Run to verify it passes**
+- [ ] **Step 5: Run to verify it passes**
 
 Run: `bundle exec rake`
 Expected: all pass.
 
-- [ ] **Step 5: Correct the design and README, then commit**
+- [ ] **Step 6: Correct the design, update the README, and commit**
 
-In the design, change "Editor wiring, which is one-time and what `ccmd setup` writes" to say that `ccmd setup` prints the wiring by default and writes it with `--write`, refusing files that contain comments. Add the same to the README.
+In `docs/designs/design.8_5_2026.ccmd_architecture.md`, change "Editor wiring, which is one-time and what `ccmd setup` writes" to say that `ccmd setup` prints the wiring by default, installs it with `--write`, and refuses files containing comments. Add the same to the README.
 
 ```bash
 git add lib/claude_code_md.rb lib/claude_code_md/cli.rb lib/claude_code_md/editor_setup.rb spec/editor_setup_spec.rb docs/designs/design.8_5_2026.ccmd_architecture.md README.md
-git commit -m "feat: ccmd setup prints or installs the editor wiring"
+git commit -m "feat: ls, trace, and setup commands"
 ```
 
 ---
 
 ## Manual Verification
 
-Automated specs never touch the real CC, so run this once after Task 15:
+Automated specs never touch the real CC, so run this once after Task 20:
 
 - [ ] `ccmd setup --write` in a scratch directory, then confirm cmd+enter creates a `.send` file
 - [ ] `ccmd scratch-test` inside a git repo, then confirm the file lands under `docs/agent-local/conversations`
 - [ ] Type a question, press cmd+enter, and watch the reply stream in without the tab closing
 - [ ] Edit a line higher up in the file while a reply streams, then confirm the reply still appends at the end and your edit survives
-- [ ] Send a second turn while the first is still streaming, then confirm it runs after the first finishes rather than interleaving
+- [ ] Send a second turn while the first is still streaming, then confirm it runs after the first rather than interleaving
+- [ ] Ask CC for a decision list, then confirm each item gets an options line
+- [ ] Answer two of three questions in place, press cmd+enter, and confirm only those two are quoted back and acknowledged
+- [ ] Press cmd+enter again without changing anything, and confirm nothing is sent
+- [ ] Correct an answer you already sent, and confirm it arrives as a follow-up
+- [ ] Reword a line CC wrote, and confirm it arrives as a diff
+- [ ] Delete a line CC wrote, and confirm it is reported in the terminal and not sent
 - [ ] Ask for something that uses tools, then confirm the conversation stays prose-only and the trace holds full results
-- [ ] Kill the `claude` child with `pkill -f 'claude -p'`, then confirm the next turn resumes the same session
+- [ ] Delete the `.state.json` mid-conversation, then confirm the next send produces no backlog
+- [ ] Kill the child with `pkill -f 'claude -p'`, then confirm the next turn resumes the same session
 - [ ] Ctrl+C, then confirm the conversation gets its interrupted note
 
 ## Self-Review Notes
 
-- Spec coverage: every section of the design maps to a task. Conversation Location to Task 8, Trace File to Tasks 6 and 10, Send Sidecar to Task 7, CC Invocation to Task 9, the Components table to Tasks 5–12, CLI Surface to Tasks 13–15, Error Handling to Tasks 10 and 12 plus the Manual Verification list.
-- Two places where the implementation intentionally diverges from the design, each with a step that corrects the design text rather than leaving a contradiction: `TurnState` collapses tool-wait (Task 11), and `ccmd setup` prints by default rather than writing (Task 15).
-- `#interrupt` on `ClaudeProcess` is dropped in favor of stop-and-resume, because the control-protocol field shapes are unverified. The design already lists in-file approvals as deferred for the same reason; Task 9's Interfaces block records the substitution.
+**Spec coverage.** Base design: Conversation Location to Task 13, Trace File to Tasks 11 and 16, Send Sidecar to Task 12, CC Invocation to Task 15, the Components table to Tasks 10–18, CLI Surface to Tasks 19–20, Error Handling to Tasks 16, 18, and the manual list. Inline-responses design: Marker Vocabulary to Task 3, Block Snapshots and The State File to Task 9, Diff Rules and Pairing to Task 6, What Gets Sent to Task 7, Resolution Without Rewriting to Tasks 9 and 18, Teaching CC The Vocabulary to Task 15, options lines to Task 16, Configuration to Task 3, every Edge Cases row to a spec in Tasks 3, 5, 6, 9, or 18.
+
+**Type consistency.** `Markers` is passed as `markers:` everywhere. `ConversationState` is `conversation_state:` in `Session` while `TurnState` is `turn_state:`, so the two never collide. `InlineResponses::Response` field names are identical in Tasks 6, 7, 9, and 16. `Session#tick` returns one of `:idle`, `:sent`, `:finished`, `:dead` in every reference.
+
+**Deliberate gaps**, each recorded in Divergences From The Designs and corrected in the design text by the task that introduces them: options lines belong to `ProseStream`, state advance belongs to `Session`, `TurnState` has two states, `ccmd setup` prints by default, `ClaudeProcess#interrupt` does not exist, and `consumed` is keyed by both hashes.
+
+**Known risk.** The thinking-delta shape is the one thing no fixture may confirm. Task 1 Step 4 makes the implementer record what CC actually emits, and Task 8 Step 4 tells them to match the fixture rather than the guess written here.
