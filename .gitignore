@@ -14,3 +14,5 @@
 # work repos. In this project the design is part of what ships, so re-include it.
 !docs/designs/
 !docs/designs/**
+!docs/plans/
+!docs/plans/**
