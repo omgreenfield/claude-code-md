@@ -4,19 +4,24 @@ Design written 8/5/2026. Companion to
 [assessment.8_5_2026.framework_and_packaging.md](assessment.8_5_2026.framework_and_packaging.md),
 which records why the stack is what it is.
 
-- [TL;DR](#tldr)
-- [Goals And Non-Goals](#goals-and-non-goals)
-- [The Loop](#the-loop)
-- [File Formats](#file-formats)
-- [CC Invocation](#cc-invocation)
-- [Components](#components)
-- [One Turn, End To End](#one-turn-end-to-end)
-- [Concurrency And File Safety](#concurrency-and-file-safety)
-- [Error Handling](#error-handling)
-- [CLI Surface](#cli-surface)
-- [Testing Strategy](#testing-strategy)
-- [Deferred](#deferred)
-- [Open Questions](#open-questions)
+- [`ccmd` Architecture](#ccmd-architecture)
+  - [TL;DR](#tldr)
+  - [Goals And Non-Goals](#goals-and-non-goals)
+  - [The Loop](#the-loop)
+  - [File Formats](#file-formats)
+    - [Conversation File](#conversation-file)
+    - [Trace File](#trace-file)
+    - [Send Sidecar](#send-sidecar)
+  - [Conversation Location](#conversation-location)
+  - [CC Invocation](#cc-invocation)
+  - [Components](#components)
+  - [One Turn, End To End](#one-turn-end-to-end)
+  - [Concurrency And File Safety](#concurrency-and-file-safety)
+  - [Error Handling](#error-handling)
+  - [CLI Surface](#cli-surface)
+  - [Testing Strategy](#testing-strategy)
+  - [Deferred](#deferred)
+  - [Resolved Questions](#resolved-questions)
 
 ## TL;DR
 
@@ -135,15 +140,54 @@ Delta extraction rule: find the last `role=me` marker, take everything after its
 
 </details>
 
-- `Read(spec/models/foo_spec.rb)` → 412 lines
-- `Bash(bundle exec rspec spec/models/foo_spec.rb)` → exit 1, 2.4s
+### `Read(spec/models/foo_spec.rb)`
+
+<details><summary>Result — 412 lines</summary>
+
+```
+…full tool result…
+```
+
+</details>
 
 Duration 13.1s · 2 turns · $0.041
 ```
 
+Tool results are recorded **in full**, not truncated. Writing them costs no tokens: the trace is built from data CC already streamed over stdout, those results already entered the model's context when the tool ran, and nothing in this design ever feeds the trace back into a session. Token cost is set by what goes into an API request, and a local file never goes into one.
+
+The only cost is trace size, so each result is wrapped in a collapsed `<details>` block and `--trace-max-bytes` can cap an individual result for sanity. It defaults to unlimited.
+
 ### Send Sidecar
 
 `<file>.send`. Contents are ignored; existence is the signal. Deleted the moment it is seen, before the turn starts, so a second cmd+enter during a turn queues rather than double-firing.
+
+## Conversation Location
+
+Where a conversation file lives is configurable, with two shapes: repo-relative or global.
+
+Resolution order, first match wins:
+
+| Source | Meaning |
+| --- | --- |
+| A path argument containing `/` or ending in `.md` | Used verbatim. No resolution happens |
+| `--dir PATH` | Explicit directory for this invocation |
+| `--repo` / `--global` | Force a shape, using the defaults below |
+| `CCMD_LOCATION` | `repo` or `global` |
+| Inside a git repo | Repo-relative |
+| Otherwise | Global |
+
+Defaults, both overridable by environment variable:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CCMD_REPO_SUBDIR` | `docs/agent-local/conversations` | Appended to the git repo root |
+| `CCMD_GLOBAL_DIR` | `$HOME/trunk/docs/conversations` | Used outside a repo, or with `--global` |
+
+A bare argument with no slash and no extension is a slug, resolved inside the directory above: `ccmd flaky-spec` becomes `<dir>/conversation.8_5_2026.flaky_spec.md`.
+
+The repo-relative default sits under `docs/agent-local`, which the global gitignore already excludes. Conversations inside a work repo therefore never show up in `git status`, without ccmd writing to `.git/info/exclude` or the repo's `.gitignore`. Pointing `CCMD_REPO_SUBDIR` somewhere tracked is allowed, and then keeping them out of commits is your business.
+
+`ccmd ls` scans the resolved directory. `ccmd ls --all` scans both the repo-relative and global directories.
 
 ## CC Invocation
 
@@ -231,10 +275,12 @@ Rate limit events are recorded in the trace, and surfaced in the conversation on
 | --- | --- |
 | `ccmd <file>` | Create or attach, then watch. The default and dominant path |
 | `ccmd setup` | Write the cmd+enter keybinding and the `cc-send` task |
-| `ccmd ls` | List known conversations with session id and last activity |
+| `ccmd ls` | List conversations with session id and last activity; `--all` scans both locations |
 | `ccmd trace <file>` | Open the trace beside the conversation |
 
-Flags on the default command: `--cwd`, `--model`, `--permission-mode`, `--effort`, `--new`. Frontmatter wins over flags for an existing file, so reattaching cannot silently change a conversation's model or working directory.
+Flags on the default command: `--cwd`, `--model`, `--permission-mode`, `--effort`, `--new`, `--dir`, `--repo`, `--global`, `--trace-max-bytes`.
+
+Frontmatter wins over flags for an existing file, so reattaching cannot silently change a conversation's model or working directory. Location flags are the exception — they resolve *which* file to open, so they are read before any frontmatter exists.
 
 ## Testing Strategy
 
@@ -250,8 +296,8 @@ Flags on the default command: `--cwd`, `--model`, `--permission-mode`, `--effort
 - **`ccmd fork`** to branch a conversation from a chosen turn, using `--fork-session`.
 - **`ccmd export`** to strip markers and produce a clean document.
 
-## Open Questions
+## Resolved Questions
 
-1. **Verb list.** The four commands above are inferred. Fewer is fine; substantially more would argue for a different CLI structure.
-2. **Where conversations live by default.** Options: alongside the repo they concern, or a central directory such as `~/trunk/docs/conversations`. Affects what `ccmd ls` scans.
-3. **Trace verbosity.** Whether tool results are truncated to a line or kept whole. Whole is more useful and much larger.
+1. **Verb list.** Approved as specified: default, `setup`, `ls`, `trace`.
+2. **Where conversations live.** Configurable, repo-relative or global, specified in [Conversation Location](#conversation-location).
+3. **Trace verbosity.** Full tool results. Writing them costs no tokens, since the trace is assembled from output CC already streamed and is never read back into a session. Size is managed by collapsing each result and by an opt-in `--trace-max-bytes` cap. See [Trace File](#trace-file).
