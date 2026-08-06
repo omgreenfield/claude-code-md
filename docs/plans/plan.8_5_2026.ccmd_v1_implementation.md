@@ -729,7 +729,8 @@ RSpec.describe ClaudeCodeMd::BlockIndex do
   it "excludes the marker comment and heading from the body" do
     body = described_class.call(conversation).first.body
 
-    expect(body).not_to include("ccmd:turn").and not_include("## Me")
+    expect(body).not_to include("ccmd:turn")
+    expect(body).not_to include("## Me")
     expect(body.strip).to eq("why is this flaky")
   end
 
@@ -858,7 +859,7 @@ Add `require_relative "claude_code_md/block_index"` to `lib/claude_code_md.rb`.
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `bundle exec rake`
-Expected: all pass. RSpec has no `not_include` matcher — if Step 1's compound expectation fails to parse, split it into two `expect` lines rather than inventing a matcher.
+Expected: all pass.
 
 - [ ] **Step 5: Commit**
 
@@ -934,7 +935,9 @@ RSpec.describe ClaudeCodeMd::InlineResponses do
   # Stands in for ConversationState, which Task 9 builds.
   let(:state) do
     Class.new do
-      def initialize(snapshots) = @snapshots = snapshots
+      def initialize(snapshots)
+        @snapshots = snapshots
+      end
       def snapshot_for(turn:, role:) = @snapshots[[turn, role]]
       def consumed?(marker_sha:, response_sha:) = false
     end
@@ -957,7 +960,7 @@ RSpec.describe ClaudeCodeMd::InlineResponses do
     answered = asked.sub("- ❓ Should ls scan both locations?\n",
                          "- ❓ Should ls scan both locations?\n  - ✅ Yes\n")
     result = described_class.call(blocks: [cc_block(answered)],
-                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+                                  state: snapshot_state([3, :cc] => asked), markers: markers)
 
     expect(result.responses.size).to eq(1)
     expect(result.responses.first).to have_attributes(
@@ -976,7 +979,7 @@ RSpec.describe ClaudeCodeMd::InlineResponses do
         - 💬 200ms, and make it configurable.
     MD
     result = described_class.call(blocks: [cc_block(answered)],
-                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+                                  state: snapshot_state([3, :cc] => asked), markers: markers)
 
     expect(result.responses.map(&:text)).to eq(["- ✅ Yes", "- 💬 200ms, and make it configurable."])
     expect(result.responses.map { |response| response.prompt[0..4] }).to eq(["- ❓ S", "- ❗️ C"])
@@ -986,7 +989,7 @@ RSpec.describe ClaudeCodeMd::InlineResponses do
     answered = asked.sub("- ❗️ Confirm the poll interval.\n",
                          "- ❗️ Confirm the poll interval.\n  - 💬 200ms\n  - and configurable\n")
     result = described_class.call(blocks: [cc_block(answered)],
-                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+                                  state: snapshot_state([3, :cc] => asked), markers: markers)
 
     expect(result.responses.map(&:text)).to eq(["- 💬 200ms\n  - and configurable"])
   end
@@ -995,7 +998,7 @@ RSpec.describe ClaudeCodeMd::InlineResponses do
     answered = asked.sub("- ❓ Should ls scan both locations?\n",
                          "- ❓ Should ls scan both locations?\n  yes please\n")
     result = described_class.call(blocks: [cc_block(answered)],
-                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+                                  state: snapshot_state([3, :cc] => asked), markers: markers)
 
     expect(result.responses.first.text).to eq("yes please")
   end
@@ -1003,7 +1006,7 @@ RSpec.describe ClaudeCodeMd::InlineResponses do
   it "treats a line at column zero as a block-level annotation" do
     annotated = "#{asked}\nthis whole list is premature\n"
     result = described_class.call(blocks: [cc_block(annotated)],
-                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+                                  state: snapshot_state([3, :cc] => asked), markers: markers)
 
     expect(result.responses.first).to have_attributes(kind: :annotation, prompt: nil,
                                                       text: "this whole list is premature")
@@ -1012,7 +1015,7 @@ RSpec.describe ClaudeCodeMd::InlineResponses do
   it "treats a marker the user adds as a new prompt, not an answer" do
     annotated = "#{asked}- ❗️ also check the trace format\n"
     result = described_class.call(blocks: [cc_block(annotated)],
-                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+                                  state: snapshot_state([3, :cc] => asked), markers: markers)
 
     expect(result.responses.first.kind).to eq(:annotation)
   end
@@ -1020,7 +1023,7 @@ RSpec.describe ClaudeCodeMd::InlineResponses do
   it "ignores a question inside a fenced code block" do
     fenced = "#{asked}\n```markdown\n- ❓ an example\n  - ✅ not a real answer\n```\n"
     result = described_class.call(blocks: [cc_block(fenced)],
-                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+                                  state: snapshot_state([3, :cc] => asked), markers: markers)
 
     expect(result.responses.map(&:kind)).to all(eq(:annotation))
     expect(result.responses.none? { |response| response.prompt&.include?("an example") }).to be(true)
@@ -1041,7 +1044,7 @@ RSpec.describe ClaudeCodeMd::InlineResponses do
   it "sends an edit to CC's prose as a diff and reports the deletion" do
     edited = asked.sub("Two things:", "Two things (I reworded this):")
     result = described_class.call(blocks: [cc_block(edited)],
-                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+                                  state: snapshot_state([3, :cc] => asked), markers: markers)
 
     edit = result.responses.find { |response| response.kind == :edit }
 
@@ -1052,7 +1055,7 @@ RSpec.describe ClaudeCodeMd::InlineResponses do
   it "reports a pure deletion without sending a response" do
     shortened = asked.sub("- ❗️ Confirm the poll interval.\n", "")
     result = described_class.call(blocks: [cc_block(shortened)],
-                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+                                  state: snapshot_state([3, :cc] => asked), markers: markers)
 
     expect(result.responses.map(&:kind)).to eq([:edit])
     expect(result.deletions.size).to eq(1)
@@ -1062,7 +1065,7 @@ RSpec.describe ClaudeCodeMd::InlineResponses do
     with_options = asked.sub("- ❓ Should ls scan both locations?\n",
                              "- ❓ Should ls scan both locations?\n#{markers.options_line(indent: 0)}")
     result = described_class.call(blocks: [cc_block(with_options)],
-                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+                                  state: snapshot_state([3, :cc] => asked), markers: markers)
 
     expect(result.responses).to be_empty
   end
@@ -1070,7 +1073,7 @@ RSpec.describe ClaudeCodeMd::InlineResponses do
   it "ignores whitespace-only changes" do
     padded = "#{asked}\n\n"
     result = described_class.call(blocks: [cc_block(padded)],
-                                  state: snapshot_state([[3, :cc]] => asked), markers: markers)
+                                  state: snapshot_state([3, :cc] => asked), markers: markers)
 
     expect(result.responses).to be_empty
   end
